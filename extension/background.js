@@ -173,6 +173,8 @@ async function tick() {
     if (done) await finish(job, true, done);
     else await store.set('job', job);
   } catch (e) {
+    // 出错现场（淘宝返回的网页等）传到小库存，方便排查
+    if (e.debug) await server('/api/agent/debug', { message: e.message, ...e.debug }).catch(() => {});
     if (job) await finish(job, false, e.message ?? String(e));
     else await log(`出错：${e.message ?? e}`);
   } finally {

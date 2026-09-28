@@ -12,6 +12,8 @@ function pageFetch(req) {
       credentials: 'include',
       headers: req.body ? { 'content-type': 'application/x-www-form-urlencoded' } : {},
       body: req.body,
+      // 下载报表时像在「订单导出报表」页点按钮一样带上完整来源页
+      ...(req.referrer ? { referrer: req.referrer, referrerPolicy: 'unsafe-url' } : {}),
     });
     const out = { status: r.status, url: r.url };
     if (req.as === 'base64') {
@@ -42,17 +44,19 @@ export class Taobao {
   }
 
   /** mtop 接口：sign = md5(token&t&appKey&data)，token 过期时淘宝会下发新的，重试一次 */
-  async mtop(api, data, retry = true) {
+  async mtop(api, data, retry = true, opts = {}) {
     const ck = await chrome.cookies.get({ url: 'https://h5api.m.taobao.com/', name: '_m_h5_tk' });
     const token = (ck?.value ?? '').split('_')[0];
     const t = Date.now();
     const d = JSON.stringify(data);
     const sign = md5(`${token}&${t}&${APP_KEY}&${d}`);
-    const url = `https://h5api.m.taobao.com/h5/${api}/1.0/?jsv=2.6.1&appKey=${APP_KEY}&t=${t}&sign=${sign}&api=${api}&v=1.0&type=originaljson&dataType=json`;
-    const r = await this.fetch({ url, method: 'POST', body: 'data=' + encodeURIComponent(d), as: 'json' });
+    const base = `https://h5api.m.taobao.com/h5/${api}/1.0/?jsv=2.6.1&appKey=${APP_KEY}&t=${t}&sign=${sign}&api=${api}&v=1.0&type=originaljson&dataType=json`;
+    const r = opts.get
+      ? await this.fetch({ url: `${base}&valueType=string&data=${encodeURIComponent(d)}`, as: 'json' })
+      : await this.fetch({ url: base, method: 'POST', body: 'data=' + encodeURIComponent(d), as: 'json' });
     const ret = String(r.data?.ret?.[0] ?? '');
     if (ret.startsWith('SUCCESS')) return r.data.data;
-    if (retry && /TOKEN_EMPTY|TOKEN_EXOIRED|TOKEN_EXPIRED/.test(ret)) return this.mtop(api, data, false);
+    if (retry && /TOKEN_EMPTY|TOKEN_EXOIRED|TOKEN_EXPIRED/.test(ret)) return this.mtop(api, data, false, opts);
     if (/RGV587|FAIL_SYS_USER_VALIDATE/.test(ret)) throw new Error('淘宝要求验证（滑块），请打开千牛页面手动验证后再试');
     throw new Error(`${api}：${ret || '请求失败'}`);
   }
@@ -74,7 +78,7 @@ export class Taobao {
 
   /** 已生成的报表（最近的在前）：{ exportId, exportType, exportStatus, applyTime, ... } */
   async exportList() {
-    const d = await this.mtop('mtop.taobao.trade.order.exportlist', { page: 1 });
+    const d = await this.mtop('mtop.taobao.trade.order.exportlist', { page: 1 }, true, { get: true });
     const list = typeof d.detailList === 'string' ? JSON.parse(d.detailList) : d.detailList;
     return list ?? [];
   }
@@ -84,37 +88,36 @@ export class Taobao {
    * 先由插件后台直接请求（有淘宝域名权限，不受跨域限制，带浏览器里的登录 cookie）；不行再从千牛页面里请求。
    */
   async download(x) {
+    const need = { f_p: x.orderEncrypterStr, apply_time: x.applyTime, start_time: x.startTimeStr, end_time: x.endTimeStr, export_id: x.exportId };
+    const missing = Object.keys(need).filter((k) => !need[k]);
+    if (missing.length) throw Object.assign(new Error(`报表信息缺字段 ${missing.join('、')}`), { debug: { report: x } });
     // 和千牛页面一样用 %20 编码空格；URLSearchParams 会编成 +，淘宝不认，返回错误页
-    const q = Object.entries({
-      f_p: x.orderEncrypterStr,
-      apply_time: x.applyTime,
-      start_time: x.startTimeStr,
-      end_time: x.endTimeStr,
-      order_status: x.orderStatus ?? '全部',
-      export_id: x.exportId,
-      isQnNew: 'true',
-    })
+    const q = Object.entries({ ...need, order_status: x.orderStatus || '全部', isQnNew: 'true' })
       .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
       .join('&');
-    const url = `https://trade.taobao.com/trade/itemlist/export_by_tfs.do?${q}`;
-    const errors = [];
+    // 参数顺序也照千牛页面
+    const url = `https://trade.taobao.com/trade/itemlist/export_by_tfs.do?${reorder(q)}`;
+    const attempts = [];
+    // 1. 从千牛页面里请求，带上「订单导出报表」页作为来源（和手动点下载一样）
+    try {
+      const r = await this.fetch({ url, as: 'base64', referrer: 'https://myseller.taobao.com/home.htm/trade-platform/tp/export-list' });
+      const buf = Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0));
+      if (r.status === 200 && isXlsx(buf)) return r.data;
+      attempts.push({ via: '页面', status: r.status, type: r.type, text: decode(buf) });
+    } catch (e) {
+      attempts.push({ via: '页面', error: e.message ?? String(e) });
+    }
+    // 2. 插件后台直接请求（有淘宝域名权限，不受跨域限制）
     try {
       const r = await fetch(url, { credentials: 'include' });
       const buf = new Uint8Array(await r.arrayBuffer());
       if (r.ok && isXlsx(buf)) return toBase64(buf);
-      errors.push(`后台 HTTP ${r.status} ${r.headers.get('content-type') ?? ''} ${preview(buf)}`);
+      attempts.push({ via: '后台', status: r.status, type: r.headers.get('content-type') ?? '', text: decode(buf) });
     } catch (e) {
-      errors.push(`后台 ${e.message ?? e}`);
+      attempts.push({ via: '后台', error: e.message ?? String(e) });
     }
-    try {
-      const r = await this.fetch({ url, as: 'base64' });
-      const buf = Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0));
-      if (r.status === 200 && isXlsx(buf)) return r.data;
-      errors.push(`页面 HTTP ${r.status} ${r.type} ${preview(buf)}`);
-    } catch (e) {
-      errors.push(`页面 ${e.message ?? e}`);
-    }
-    throw new Error(`报表下载失败（${errors.join('；')}）`);
+    const brief = attempts.map((a) => `${a.via} ${a.error ?? `HTTP ${a.status} ${summary(a.text)}`}`).join('；');
+    throw Object.assign(new Error(`报表下载失败（${brief}）`), { debug: { report: x, url, attempts } });
   }
 
   // ---------------------------------------------------------------- 商品 SKU
@@ -145,13 +148,27 @@ export class Taobao {
 
 // xlsx 是 zip，开头是 PK
 const isXlsx = (buf) => buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b;
-/** 返回的不是文件时，给出网页标题和正文开头，方便看出原因（淘宝页面是 GBK） */
-function preview(buf) {
-  const html = new TextDecoder('gbk').decode(buf.slice(0, 20000));
+/** 淘宝网页是 GBK；解不了就按 UTF-8 */
+function decode(buf) {
+  const bytes = buf.slice(0, 50000);
+  try {
+    return new TextDecoder('gbk').decode(bytes);
+  } catch {
+    return new TextDecoder().decode(bytes);
+  }
+}
+/** 返回的不是文件时，给出网页标题和正文开头，方便看出原因 */
+function summary(html) {
   const title = html.match(/<title>([^<]*)<\/title>/i)?.[1]?.trim() ?? '';
   const body = html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<[^>]+>/gi, ' ').replace(/\s+/g, ' ').trim();
-  return `「${title}」${body.slice(0, 150)}`;
+  return `「${title}」${body.slice(0, 120)}`;
 }
+const ORDER = ['f_p', 'apply_time', 'start_time', 'end_time', 'order_status', 'export_id', 'isQnNew'];
+const reorder = (q) =>
+  q
+    .split('&')
+    .sort((a, b) => ORDER.indexOf(a.split('=')[0]) - ORDER.indexOf(b.split('=')[0]))
+    .join('&');
 function toBase64(bytes) {
   let bin = '';
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));

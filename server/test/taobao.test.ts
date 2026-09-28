@@ -532,6 +532,7 @@ test('淘宝插件：连接码鉴权、领任务、上传商品 SKU 清单（自
   assert.equal(own.kind, 'sync_orders');
   const report = await importOrders([O1, O2], false, { url: '/api/agent/orders', headers: { authorization: `Bearer ${token}` } });
   assert.equal(report.created_sales.length, 0);
+  assert.equal((await agentApi('POST', '/api/agent/debug', token, { message: '报表下载失败', attempts: [] })).status, 200);
   await api('POST', '/api/plugin/token'); // 重置后旧码失效
   assert.equal((await agentApi('POST', '/api/agent/next', token)).status, 401);
 });

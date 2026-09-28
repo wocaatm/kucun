@@ -2,7 +2,7 @@ import Fastify, { type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
-import { createReadStream, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { openDb, log, tx, dryRun, type DB } from './db.ts';
@@ -585,6 +585,15 @@ export function buildApp(opts: AppOptions) {
   });
   // 插件自己按时发起的任务也记一笔，页面上能看到
   app.post('/api/agent/tasks', async (req) => ({ task: agent.startOwnTask(db, String((req.body as any)?.kind ?? '')) }));
+  // 插件出错时的现场（淘宝返回的网页等），存成文件方便排查，只留最近 20 份
+  app.post('/api/agent/debug', async (req) => {
+    const dir = join(dataDir, 'imports', 'debug');
+    mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/\D/g, '').slice(0, 14);
+    writeFileSync(join(dir, `${stamp}.json`), JSON.stringify(req.body ?? {}, null, 2));
+    for (const f of readdirSync(dir).sort().slice(0, -20)) rmSync(join(dir, f));
+    return { ok: true };
+  });
   app.post('/api/agent/skus', async (req) => ({ result: taobao.syncCatalog(db, req.user.id, ((req.body as any)?.items ?? []) as taobao.CatalogInput[]) }));
 
   app.get('/api/taobao/overview', async () => ({
