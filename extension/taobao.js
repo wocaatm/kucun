@@ -88,7 +88,8 @@ export class Taobao {
    * 先由插件后台直接请求（有淘宝域名权限，不受跨域限制，带浏览器里的登录 cookie）；不行再从千牛页面里请求。
    */
   async download(x) {
-    const need = { f_p: x.orderEncrypterStr, apply_time: x.applyTime, start_time: x.startTimeStr, end_time: x.endTimeStr, export_id: x.exportId };
+    // 文件地址：订单报表叫 orderEncrypterStr，宝贝明细报表叫 itemEncrypterStr
+    const need = { f_p: x.orderEncrypterStr || x.itemEncrypterStr, apply_time: x.applyTime, start_time: x.startTimeStr, end_time: x.endTimeStr, export_id: x.exportId };
     const missing = Object.keys(need).filter((k) => !need[k]);
     if (missing.length) throw Object.assign(new Error(`报表信息缺字段 ${missing.join('、')}`), { debug: { report: x } });
     // 和千牛页面一样用 %20 编码空格；URLSearchParams 会编成 +，淘宝不认，返回错误页
