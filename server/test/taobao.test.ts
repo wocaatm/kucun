@@ -122,7 +122,7 @@ const itemRows = (orders: Order[]) =>
     })),
   );
 
-async function importOrders(orders: Order[], dry = false) {
+async function importOrders(orders: Order[], dry = false, auth?: { url: string; headers: Record<string, string> }) {
   const boundary = '----kucuntest';
   const part = (name: string, filename: string, buf: Buffer) =>
     Buffer.concat([
@@ -138,9 +138,9 @@ async function importOrders(orders: Order[], dry = false) {
   ]);
   const res = await app.inject({
     method: 'POST',
-    url: '/api/taobao/import',
+    url: auth?.url ?? '/api/taobao/import',
     payload,
-    headers: { cookie, 'content-type': `multipart/form-data; boundary=${boundary}` },
+    headers: { ...(auth?.headers ?? { cookie }), 'content-type': `multipart/form-data; boundary=${boundary}` },
   });
   const json = res.json();
   if (res.statusCode >= 400) throw new Error(json.error);
@@ -267,16 +267,16 @@ test('淘宝导入：发货即记销售和应收；对不上的商品只记金�
   assert.equal(r1.created_sales.length, 4);
   assert.equal(r1.auto_mapped, 2); // 隔离霜、护手霜；套装不猜
   assert.equal(r1.unmatched_orders, 4);
-  assert.equal(r1.unmatched_amount, 6000 + 2000 + 2500 + 6000);
+  assert.equal(r1.unmatched_amount, 6000 + 500 + 2000 + 2500 + 6000); // T1 整单没对上，邮费也先挂起
   assert.equal(r1.to_ship, 1);
   assert.equal(await stock(A), 10);
   assert.equal(await stock(B), 10);
   assert.equal(await stock(C), 10);
   const products = (await api('GET', '/api/products?limit=100')).items.length;
   const d0 = await api('GET', '/api/dashboard');
-  // 没对上的行先不计入销售额（只剩 T1 的邮费 5 元），应收照样是全额
-  assert.equal(d0.total_profit.revenue, 500);
-  assert.deepEqual(d0.total_profit.pending, { amount: 16500, orders: 4 });
+  // 没对上的订单（连同邮费）先不计入销售额，应收照样是全额
+  assert.equal(d0.total_profit.revenue, 0);
+  assert.deepEqual(d0.total_profit.pending, { amount: 17000, orders: 4 });
   assert.equal(d0.receivable.amount, 6500 + 2500 + 6000);
   assert.equal(d0.taobao.unmatched_orders, 4);
   const um = (await api('GET', '/api/taobao/overview')).unmatched;
@@ -330,7 +330,9 @@ test('淘宝导入：发货即记销售和应收；对不上的商品只记金�
   const d5 = await api('GET', '/api/dashboard');
   assert.equal(d5.taobao.unmatched_orders, 0);
   assert.equal(d5.total_profit.revenue, 6500 + 2000 + 2500 + 6000); // 核对后计入
-  await assert.rejects(api('PUT', '/api/taobao/orders/T5/actual', { as_ordered: true }), /已经确认/);
+  const t5 = await api('GET', '/api/taobao/orders/T5');
+  assert.equal(t5.actual.text, 'LACURA 熊果苷发光水 200ml ×1');
+  assert.equal(t5.logs.length, 1);
 
   // 同一份数据再导一次：什么都不新增
   const again = await importOrders([O1, O2, O3, O4, O5, O6]);
@@ -407,41 +409,71 @@ test('淘宝导入：没对上的商品发货后退款，只退钱；之后补�
   assert.equal(await stock(A), 7);
 });
 
-test('刷单：标记后不算销售额、只扣实际发出的商品，回款冲抵返款；取消后恢复', async () => {
+test('改实发：刷单空包不扣库存、销售额照算；改回按下单；待发货可先填；货退回来的订单不能改', async () => {
   const before = await api('GET', '/api/dashboard');
   const bBefore = await stock(B);
   const cash = await pubBalance();
-  // T2（交易成功，已到账）其实是刷单：空包，给刷手返了 25 元
-  await api('POST', '/api/docs', { type: 'expense', category: '刷单', account_id: pub, amount: 2500, note: '某某刷单' });
-  const r = await api('PUT', '/api/taobao/orders/T2/fake', { fake: true, items: [] });
+  const lq = (await api('GET', '/api/meta')).accounts.find((a: any) => a.name === '卢琼').id;
+  // T2（交易成功，已到账）其实是刷单：空包；卢琼私下给刷手发了 25 元红包
+  await api('POST', '/api/docs', { type: 'expense', category: '刷单', account_id: lq, amount: 2500, note: '红包' });
+  const r = await api('PUT', '/api/taobao/orders/T2/actual', { items: [] });
   assert.equal(r.result.rebuilt_sales.length, 1);
   assert.equal(await stock(B), bBefore + 1); // 护手霜没真发出去，库存回来
-  assert.equal(await pubBalance(), cash - 2500); // 淘宝的钱照样到账，只少了返款
-
+  assert.equal(await pubBalance(), cash); // 淘宝的钱照样到账
   const d = await api('GET', '/api/dashboard');
-  assert.equal(d.total_profit.revenue, before.total_profit.revenue - 2000);
-  assert.deepEqual(d.total_profit.fake, { expense: 2500, income: 2000, goods_cost: 0, net_cost: 500 });
-  assert.equal(d.taobao.fake_orders, 1);
+  assert.equal(d.total_profit.revenue, before.total_profit.revenue); // 销售额照算
+  assert.equal(d.total_profit.net, before.total_profit.net - 2500 + 1000); // 红包算支出，省下护手霜成本
   const sale = (await api('GET', `/api/docs/${r.result.rebuilt_sales[0]}`)).doc;
-  assert.equal(sale.category, '刷单');
   assert.equal(sale.received, 1);
-  assert.deepEqual(sale.adjustments.map((a: any) => [a.name, a.amount]), [['刷单回款', 2000]]);
+  assert.equal(sale.items.length, 0);
+  assert.deepEqual(sale.adjustments.map((a: any) => [a.name, a.amount]), [['货款：空包', 2000]]);
+  assert.equal(d.taobao.unmatched_orders, before.taobao.unmatched_orders);
 
-  // 其实寄了一支护手霜：只扣这一件，成本算刷单花费
-  const r2 = await api('PUT', '/api/taobao/orders/T2/fake', { fake: true, items: [{ product_id: B, qty: 1 }] });
+  // 改回按下单的发
+  await api('PUT', '/api/taobao/orders/T2/actual', { as_ordered: true });
   assert.equal(await stock(B), bBefore);
-  const d2 = await api('GET', '/api/dashboard');
-  assert.equal(d2.total_profit.fake.goods_cost, 1000);
-  assert.equal(d2.total_profit.revenue, before.total_profit.revenue - 2000);
-  assert.equal(d2.total_profit.net, d.total_profit.net - 1000);
+  const t2 = await api('GET', '/api/taobao/orders/T2');
+  assert.equal(t2.actual.text, '按下单发');
+  assert.deepEqual(t2.logs.map((l: any) => JSON.parse(l.detail).after), ['按下单发', '空包']);
+  assert.equal(t2.docs.filter((x: any) => x.status === 'active').length, 1);
 
-  // 取消刷单：回到原样（返款仍是支出）
-  await api('PUT', '/api/taobao/orders/T2/fake', { fake: false });
-  const d3 = await api('GET', '/api/dashboard');
-  assert.equal(d3.total_profit.revenue, before.total_profit.revenue);
-  assert.equal(d3.taobao.fake_orders, 0);
-  assert.equal(await stock(B), bBefore);
-  void r2;
+  // 待发货的 T3（隔离霜）先填好实发：发光水；发货导入后按实发扣
+  const [a0, c0] = [await stock(A), await stock(C)];
+  const list = await api('GET', '/api/taobao/orders?group=to_ship');
+  assert.deepEqual(list.items.map((o: any) => o.order_no), ['T3']);
+  await api('PUT', '/api/taobao/orders/T3/actual', { items: [{ product_id: C, qty: 1 }] });
+  assert.equal(await stock(C), c0);
+  await importOrders([{ ...O3, status: '卖家已发货，等待买家确认', shipped: '2026-09-24 09:00:00' }]);
+  assert.equal(await stock(A), a0);
+  assert.equal(await stock(C), c0 - 1);
+  assert.equal((await api('GET', '/api/taobao/orders?group=shipped')).items.some((o: any) => o.order_no === 'T3'), true);
+
+  // T6 已确认发光水退回来了：不能改实发
+  assert.equal((await api('GET', '/api/taobao/orders/T6')).returned, true);
+  await assert.rejects(api('PUT', '/api/taobao/orders/T6/actual', { items: [] }), /退回来/);
+});
+
+test('改实发：只退了钱的订单可以改，退款转成不关联商品的金额', async () => {
+  const O8: Order = {
+    no: 'T8',
+    status: '卖家已发货，等待买家确认',
+    paid: '20.00',
+    shipped: '2026-09-25 09:00:00',
+    subs: [{ sub: 'T8-1', item: '200', sku: '乳果木经典护手霜75g 1支', qty: 1, paid: '20.00' }],
+  };
+  await importOrders([O8]);
+  const r = await importOrders([{ ...O8, subs: [{ ...O8.subs[0], refund: '5.00' }] }]);
+  assert.equal(r.refunds.length, 1);
+  const b0 = await stock(B);
+  const set = await api('PUT', '/api/taobao/orders/T8/actual', { items: [{ product_id: C, qty: 1 }] });
+  assert.equal(await stock(B), b0 + 1);
+  const sale = (await api('GET', `/api/docs/${set.result.rebuilt_sales[0]}`)).doc;
+  assert.equal(sale.items[0].product_id, C);
+  assert.equal(sale.returns.length, 1);
+  const ret = (await api('GET', `/api/docs/${sale.returns[0].id}`)).doc;
+  assert.equal(ret.amount, 500);
+  assert.equal(ret.items.length, 0);
+  assert.deepEqual(ret.adjustments.map((a: any) => [a.name, a.amount]), [['退款', 500]]);
 });
 
 test('改单据日期和支出分类：不动金额；淘宝单据不能改日期', async () => {
@@ -452,4 +484,54 @@ test('改单据日期和支出分类：不动金额；淘宝单据不能改日�
   await assert.rejects(api('PATCH', `/api/docs/${doc.id}`, { category: '不存在' }), /分类/);
   const tb = (await api('GET', '/api/docs?q=T1')).items.find((x: any) => x.status === 'active' && x.type === 'sale');
   await assert.rejects(api('PATCH', `/api/docs/${tb.id}`, { doc_date: '2026-01-01' }), /不能改/);
+});
+
+test('淘宝插件：连接码鉴权、领任务、上传商品 SKU 清单（自动猜对照待确认）和订单表', async () => {
+  const agentApi = async (method: string, url: string, token: string, body?: unknown) => {
+    const res = await app.inject({ method: method as any, url, payload: body as any, headers: { authorization: `Bearer ${token}` } });
+    return { status: res.statusCode, json: res.json() };
+  };
+  assert.equal((await agentApi('POST', '/api/agent/next', 'nope')).status, 401);
+  const { token } = await api('POST', '/api/plugin/token');
+  assert.match(token, /^kc_/);
+  assert.equal((await agentApi('POST', '/api/agent/next', token)).json.task, null);
+  assert.ok((await api('GET', '/api/plugin')).last_seen);
+
+  // 页面上点「拉取商品 SKU」→ 插件领到 → 回报完成；重复点不重复排
+  const t1 = await api('POST', '/api/plugin/tasks', { kind: 'sync_skus' });
+  const t2 = await api('POST', '/api/plugin/tasks', { kind: 'sync_skus' });
+  assert.equal(t1.id, t2.id);
+  const next = (await agentApi('POST', '/api/agent/next', token)).json.task;
+  assert.deepEqual(next, { id: t1.id, kind: 'sync_skus' });
+  const up = await agentApi('POST', '/api/agent/skus', token, {
+    items: [
+      { item_id: '100', title: '奥乐齐 LACURA柔光焕彩隔离霜40g', skus: [{ sku_id: '1', prop: 'LACURA隔离霜40g', price: '49.80' }] },
+      { item_id: '600', title: '奥乐齐 LACURA 熊果苷发光水 200ml', skus: [{ sku_id: '2', prop: '熊果苷发光水200ml', price: '49.80' }] },
+      { item_id: '700', title: '奥乐齐 没有规格的东西', skus: [] },
+    ],
+  });
+  assert.equal(up.status, 200);
+  assert.equal(up.json.result.items, 3);
+  await agentApi('POST', `/api/agent/tasks/${t1.id}`, token, { ok: true, message: '3 个商品' });
+  const st = await api('GET', '/api/plugin');
+  assert.equal(st.tasks[0].status, 'done');
+
+  const skus = (await api('GET', '/api/taobao/overview')).skus;
+  const s600 = skus.find((x: any) => x.item_id === '600');
+  assert.equal(s600.sku, '商品规格:熊果苷发光水200ml');
+  assert.equal(s600.lines, 0);
+  assert.equal(s600.state, 'auto'); // 没卖过也先猜好，等确认
+  assert.equal(s600.products[0].product_id, C);
+  assert.equal(s600.suggestions[0].product_id, C); // 候选按相似度排好，给人挑
+  assert.ok(s600.suggestions[0].score >= 0.75);
+  assert.equal(skus.find((x: any) => x.item_id === '100' && x.sku === '商品规格:LACURA隔离霜40g').state, 'confirmed'); // 已有对照不动
+  assert.ok(skus.some((x: any) => x.item_id === '700' && x.sku === ''));
+
+  // 插件自己按时同步订单：记一笔任务，上传两张表
+  const own = (await agentApi('POST', '/api/agent/tasks', token, { kind: 'sync_orders' })).json.task;
+  assert.equal(own.kind, 'sync_orders');
+  const report = await importOrders([O1, O2], false, { url: '/api/agent/orders', headers: { authorization: `Bearer ${token}` } });
+  assert.equal(report.created_sales.length, 0);
+  await api('POST', '/api/plugin/token'); // 重置后旧码失效
+  assert.equal((await agentApi('POST', '/api/agent/next', token)).status, 401);
 });

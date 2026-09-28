@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { replayProduct, landedCosts } from './inventory.ts';
 import { USERS, DEFAULT_PASSWORD } from './settings.ts';
 import { hashPassword } from './auth.ts';
+import { migrateAgent } from './agent.ts';
 
 // 金额一律以「分」为整数存储
 const SCHEMA = `
@@ -212,14 +213,41 @@ function migrate(db: DB) {
     PRIMARY KEY (item_id, sku, product_id)
   )`);
   backfillLandedCost(db);
-  addTo('taobao_orders', 'fake', 'INTEGER NOT NULL DEFAULT 0'); // 1 = 刷单：不算销售额，回款冲抵刷单返款
-  // 商家备注里写了「实际发…」的订单 / 刷单实际发出的商品
+  // 订单实际发出的商品（有商家备注的要核对；刷单空包、改发别的也在这里改）
   db.exec(`CREATE TABLE IF NOT EXISTS taobao_actual (
     order_no TEXT NOT NULL,
     product_id INTEGER NOT NULL,
     qty INTEGER NOT NULL,
     PRIMARY KEY (order_no, product_id)
   )`);
+  // 1 = 按 taobao_actual 发货（没有行就是空包），0 = 按下单的 SKU 对照发货
+  if (!(db.prepare('PRAGMA table_info(taobao_orders)').all() as { name: string }[]).some((c) => c.name === 'actual_custom')) {
+    db.exec('ALTER TABLE taobao_orders ADD COLUMN actual_custom INTEGER NOT NULL DEFAULT 0');
+    db.exec('UPDATE taobao_orders SET actual_custom = 1 WHERE order_no IN (SELECT order_no FROM taobao_actual)');
+  }
+  // 淘宝商品和 SKU 清单（插件从千牛「我的商品」拉来）；sku 与子订单的「商品属性」同格式，用来提前对照
+  db.exec(`CREATE TABLE IF NOT EXISTS taobao_items (
+    item_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    synced_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS taobao_skus (
+    item_id TEXT NOT NULL,
+    sku_id TEXT NOT NULL,                  -- 无规格的商品为 ''
+    sku TEXT NOT NULL,                     -- 如「商品规格:LACURA隔离霜40g」
+    price INTEGER NOT NULL DEFAULT 0,
+    synced_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    PRIMARY KEY (item_id, sku_id)
+  )`);
+  migrateAgent(db);
+  // v1：成本改为按单据日期重放，全部商品重算一次
+  if ((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version < 1) {
+    tx(db, () => {
+      for (const { id } of db.prepare('SELECT id FROM products').all() as { id: number }[]) replayProduct(db, id);
+    });
+    db.exec('PRAGMA user_version = 1');
+  }
 }
 
 /** 老的进货单：按实付重新算每行成本（优惠 / 运费摊进商品），然后重放受影响的商品 */

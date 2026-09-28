@@ -3,8 +3,7 @@ import { tx, log } from './db.ts';
 import { createDoc, createReturn, voidDoc, BizError, normalizeName, today, type ItemInput } from './docs.ts';
 import { productFromCatalog } from './catalog.ts';
 import { allocate } from './inventory.ts';
-import { FAKE_CATEGORY } from './settings.ts';
-import { nameScore, titleScore, similarity } from './vision.ts';
+import { nameScore, titleScore } from './vision.ts';
 
 /**
  * 淘宝订单导入（千牛导出的「订单列表」主订单表 + 子订单表）。
@@ -13,7 +12,8 @@ import { nameScore, titleScore, similarity } from './vision.ts';
  * - 主订单变成交易成功 → 销售单标「已到账」
  * - 发货后退款成功 → 自动生成「待处理退款」（仅退款），等人工确认货有没有退回
  * - 没发货就关闭 / 退款的子订单不生成任何单据
- * - 主订单有商家备注 → 先等人工核对实际发了什么（taobao_actual）再生成销售单
+ * - 主订单有商家备注 → 先等人工核对实际发了什么（taobao_actual）再扣库存
+ * - 任何订单都能随时改实发（刷单空包、改发别的），已生成的销售单按新实发重建
  * - SKU（商品ID + 规格）要先对照到库存商品（taobao_sku_map，套装可对多个商品），未确认的订单先不生成
  * 重复导入同一份数据是安全的：原始数据按订单号更新，已生成的单据不会重复生成。
  */
@@ -113,29 +113,26 @@ function upsertSubs(db: DB, rows: Record<string, string>[]) {
 
 // ---------------------------------------------------------------- SKU 对照
 
-interface ProductRow {
-  id: number;
-  name: string;
-  spec: string;
-}
+/** 卖过的和商品清单里的全部 SKU（去重），带标题 */
+const ALL_SKUS = `SELECT item_id, sku, MAX(title) AS title FROM (
+    SELECT item_id, sku, title FROM taobao_sub_orders
+    UNION ALL SELECT k.item_id, k.sku, COALESCE(i.title, '') FROM taobao_skus k LEFT JOIN taobao_items i ON i.item_id = k.item_id
+  ) GROUP BY item_id, sku`;
 
 /** 给没对照过的 SKU 自动找一个最像的库存商品（confirmed = 0，待人工确认） */
 function autoMapSkus(db: DB): number {
   const skus = db
     .prepare(
-      `SELECT s.item_id, s.sku, MAX(s.title) AS title FROM taobao_sub_orders s
-       WHERE NOT EXISTS (SELECT 1 FROM taobao_sku_map m WHERE m.item_id = s.item_id AND m.sku = s.sku)
-       GROUP BY s.item_id, s.sku`,
+      `SELECT a.* FROM (${ALL_SKUS}) a
+       WHERE NOT EXISTS (SELECT 1 FROM taobao_sku_map m WHERE m.item_id = a.item_id AND m.sku = a.sku)`,
     )
     .all() as { item_id: string; sku: string; title: string }[];
-  if (!skus.length) return 0;
-  const products = db.prepare('SELECT id, name, spec FROM products').all() as unknown as ProductRow[];
   const ins = db.prepare('INSERT INTO taobao_sku_map (item_id, sku, product_id, qty, confirmed) VALUES (?, ?, ?, 1, 0)');
   let n = 0;
   for (const s of skus) {
-    const best = guessProduct(products, s.title, skuLabel(s.sku));
+    const best = guessProduct(db, s.title, s.sku);
     if (best) {
-      ins.run(s.item_id, s.sku, best.id);
+      ins.run(s.item_id, s.sku, best);
       n++;
     }
   }
@@ -143,21 +140,143 @@ function autoMapSkus(db: DB): number {
 }
 
 /**
- * 规格名优先（同一个宝贝下不同规格靠它区分）：明显领先才算；规格名太弱时才看标题。
- * 有两个差不多像的就不猜，留给人工。
+ * 自动预填一个对照（仍要人确认才生效）：最像的库存商品 ≥ 60% 且比第二名领先 15% 以上才填，
+ * 套装、差不多像的都不猜，留给人从建议里挑。
  */
-export function guessProduct(products: ProductRow[], title: string, sku: string): ProductRow | null {
-  if (/套装|组合装|\+/.test(sku)) return null; // 套装要人工指定由哪几个商品组成
-  const pick = (score: (p: ProductRow) => number) => {
-    const scored = products.map((p) => ({ p, s: score(p) })).sort((a, b) => b.s - a.s);
-    return { top: scored[0], second: scored[1] };
+export function guessProduct(db: DB, title: string, sku: string): number | null {
+  if (/套装|组合装|\+/.test(skuLabel(sku))) return null;
+  const [top, second] = suggest(db, title, sku, 2).filter((x) => x.product_id);
+  if (!top || top.score < 0.6 || (second && top.score - second.score < 0.15)) return null;
+  return top.product_id!;
+}
+
+/** 给人挑的候选：库存商品（product_id）或奥乐齐参考库里还没建档的（catalog_id，选了才建档） */
+export interface Suggestion {
+  product_id?: number;
+  catalog_id?: number;
+  name: string;
+  spec: string;
+  stock_qty: number | null;
+  score: number;
+}
+
+/**
+ * 按淘宝标题 / 规格名（或商家备注）给出最像的几个商品，由人挑，系统不替人定。
+ * 多规格商品的标题列着所有规格，区分不了，所以规格名为主、标题为辅；规格里的数字（280mm、6片）对上加分、同单位对不上扣分。
+ * 库存商品都不太像时，再从奥乐齐参考库里找没建档的。
+ */
+export function suggest(db: DB, title: string, sku: string, limit = 4): Suggestion[] {
+  const label = skuLabel(sku);
+  const want = sizes(label || title);
+  const score = (name: string) => {
+    let s = label ? 0.6 * textScore(label, name) + 0.4 * textScore(title, name) : textScore(title, name);
+    const have = sizes(name);
+    if (want.length && have.length) {
+      if (want.some((w) => have.includes(w))) s += 0.15;
+      else if (want.some((w) => have.some((h) => unit(h) === unit(w)))) s -= 0.3;
+    }
+    return Math.max(0, Math.min(1, s));
   };
-  const clear = (r: ReturnType<typeof pick>) => r.top && r.top.s >= 0.5 && (!r.second || r.top.s - r.second.s >= 0.15);
-  const bySku = pick((p) => Math.max(nameScore(normalizeName(sku), normalizeName(p.name)), titleScore(sku, p.name)));
-  if (bySku.top && bySku.top.s >= 0.5) return clear(bySku) ? bySku.top.p : null;
-  const full = `${title} ${sku}`;
-  const byTitle = pick((p) => Math.max(titleScore(full, p.name), similarity(normalizeName(full), normalizeName(p.name))));
-  return clear(byTitle) ? byTitle.top.p : null;
+  const products = (db.prepare('SELECT id, name, spec, stock_qty FROM products').all() as any[])
+    .map((p) => ({ product_id: p.id, name: p.name, spec: p.spec, stock_qty: p.stock_qty, score: score(`${p.name} ${p.spec}`) }))
+    .filter((x) => x.score >= 0.35)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+  if (products[0]?.score >= 0.75) return products.map(round);
+  const catalog = (
+    db
+      .prepare(
+        `SELECT c.id, c.name, c.spec FROM catalog_items c
+         WHERE NOT EXISTS (SELECT 1 FROM products p WHERE p.source = c.source AND p.source_id = c.source_id)`,
+      )
+      .all() as any[]
+  )
+    .map((c) => ({ catalog_id: c.id, name: c.name, spec: c.spec, stock_qty: null, score: score(`${c.name} ${c.spec}`) }))
+    .filter((x) => x.score >= 0.6)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 2);
+  return [...products, ...catalog].sort((a, b) => b.score - a.score).map(round);
+}
+
+const cjk = (s: string) => s.replace(/[^\u4e00-\u9fff]/g, '');
+
+/** 两段文字的相似度：整体相似 / 长标题包含 / 共同的中文词（「护手霜」这种关键词） */
+function textScore(q: string, name: string): number {
+  if (!q.trim()) return 0;
+  const common = longestCommon(cjk(q), cjk(name));
+  return Math.max(nameScore(normalizeName(q), normalizeName(name)), titleScore(q, name), common >= 2 ? Math.min(0.9, 0.4 + common * 0.1) : 0);
+}
+
+function longestCommon(a: string, b: string): number {
+  let best = 0;
+  const prev = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = 0;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = a[i - 1] === b[j - 1] ? diag + 1 : 0;
+      if (prev[j] > best) best = prev[j];
+      diag = tmp;
+    }
+  }
+  return best;
+}
+
+/** 规格里的数量 / 容量：「280mm」「6片」「300克」→ ['280mm', '6片', '300g'] */
+function sizes(s: string): string[] {
+  return [...s.matchAll(/(\d+(?:\.\d+)?)\s*(ml|g|克|mm|片|支|只|包|条|袋|瓶|盒|罐|pc)/gi)].map((m) => {
+    const u = m[2].toLowerCase();
+    return `${Number(m[1])}${u === '克' ? 'g' : u === 'pc' ? '片' : u}`;
+  });
+}
+const unit = (x: string) => x.replace(/^[\d.]+/, '');
+const round = (x: Suggestion) => ({ ...x, score: Math.round(x.score * 100) / 100 });
+
+export interface CatalogInput {
+  item_id?: string;
+  title?: string;
+  status?: string;
+  skus?: { sku_id?: string; prop?: string; price?: string }[];
+}
+
+/**
+ * 插件上传的千牛商品清单：记下每个商品的全部 SKU（规格名和子订单「商品属性」同格式），
+ * 没对照过的自动猜一个库存商品（待确认）；已有对照不动。
+ */
+export function syncCatalog(db: DB, userId: number, items: CatalogInput[]) {
+  return tx(db, () => {
+    const upItem = db.prepare(
+      `INSERT INTO taobao_items (item_id, title, status) VALUES (?, ?, ?)
+       ON CONFLICT(item_id) DO UPDATE SET title = excluded.title, status = excluded.status, synced_at = datetime('now', 'localtime')`,
+    );
+    const upSku = db.prepare(
+      `INSERT INTO taobao_skus (item_id, sku_id, sku, price) VALUES (?, ?, ?, ?)
+       ON CONFLICT(item_id, sku_id) DO UPDATE SET sku = excluded.sku, price = excluded.price, synced_at = datetime('now', 'localtime')`,
+    );
+    let skuCount = 0;
+    for (const it of items) {
+      const itemId = String(it.item_id ?? '').trim();
+      if (!/^\d+$/.test(itemId)) continue;
+      upItem.run(itemId, it.title ?? '', it.status ?? '');
+      const skus = it.skus?.length ? it.skus : [{ sku_id: '', prop: '', price: '' }];
+      for (const k of skus) {
+        upSku.run(itemId, String(k.sku_id ?? ''), skuKey(db, itemId, k.prop ?? ''), fen(k.price));
+        skuCount++;
+      }
+    }
+    const autoMapped = autoMapSkus(db);
+    log(db, userId, 'taobao_catalog', '', { items: items.length, skus: skuCount, auto_mapped: autoMapped });
+    return { items: items.length, skus: skuCount, auto_mapped: autoMapped };
+  });
+}
+
+/** 千牛商品页的规格名 → 子订单「商品属性」的写法：优先照卖过的订单，否则按「商品规格:xxx」 */
+function skuKey(db: DB, itemId: string, prop: string): string {
+  if (!prop) return '';
+  const sold = db
+    .prepare("SELECT sku FROM taobao_sub_orders WHERE item_id = ? AND (sku = ? OR sku LIKE '%:' || ?) LIMIT 1")
+    .get(itemId, prop, prop) as { sku: string } | undefined;
+  return sold?.sku ?? `商品规格:${prop}`;
 }
 
 export interface MapItemInput {
@@ -204,8 +323,9 @@ export function confirmAllSkus(db: DB, userId: number) {
 }
 
 /**
- * 有商家备注的订单：填实际发出的商品。
- * as_ordered = 备注和实发无关（比如「退运费」），按下单的商品发；confirm = false 只存草稿
+ * 改订单实际发出的商品，任何时候都能改（待发货的也能先填好）。
+ * items 为空 = 空包；as_ordered = 按下单的商品发（备注和实发无关，或改回默认）；confirm = false 只存草稿。
+ * 已生成的销售单按新实发重建（日期、到账状态不变）；货已经退回来的订单不能改，要先作废那张退货单。
  */
 export function setActual(
   db: DB,
@@ -214,61 +334,61 @@ export function setActual(
   input: { items?: MapItemInput[]; as_ordered?: boolean; confirm?: boolean },
 ) {
   return tx(db, () => {
-    const o = db.prepare('SELECT actual_state FROM taobao_orders WHERE order_no = ?').get(orderNo) as { actual_state: string } | undefined;
+    const o = db.prepare('SELECT order_no FROM taobao_orders WHERE order_no = ?').get(orderNo);
     if (!o) throw new BizError('订单不存在');
-    if (o.actual_state === 'confirmed') throw new BizError('这个订单的实发已经确认过，不能再改；有出入请做退货或盘点');
+    if (hasReturnedGoods(db, orderNo)) throw new BizError('这个订单有货退回来了，先作废那张退货单再改实发');
+    const before = actualOf(db, orderNo);
     db.prepare('DELETE FROM taobao_actual WHERE order_no = ?').run(orderNo);
-    if (!input.as_ordered) {
-      const rows = resolveItems(db, userId, input.items ?? []);
-      if (!rows.length) throw new BizError('至少填一个实发商品');
-      const ins = db.prepare('INSERT INTO taobao_actual (order_no, product_id, qty) VALUES (?, ?, ?)');
-      for (const r of rows) ins.run(orderNo, r.product_id, r.qty);
-    }
-    const state = input.confirm === false ? 'draft' : 'confirmed';
-    db.prepare('UPDATE taobao_orders SET actual_state = ? WHERE order_no = ?').run(state, orderNo);
-    log(db, userId, 'taobao_actual', orderNo, input);
-    return processTaobao(db, userId);
-  });
-}
-
-/**
- * 标记 / 取消刷单。刷单：不算销售额，淘宝回款记「刷单回款」冲抵刷单返款；
- * items = 实际发出的商品（空包就不填），只扣这些库存，成本算刷单花费。已生成的销售单按新口径重建。
- */
-export function setFake(db: DB, userId: number, orderNo: string, input: { fake?: boolean; items?: MapItemInput[] }) {
-  return tx(db, () => {
-    const o = db.prepare('SELECT * FROM taobao_orders WHERE order_no = ?').get(orderNo) as any;
-    if (!o) throw new BizError('订单不存在');
-    const fake = input.fake !== false;
-    db.prepare('DELETE FROM taobao_actual WHERE order_no = ?').run(orderNo);
-    if (fake) {
-      const ins = db.prepare('INSERT INTO taobao_actual (order_no, product_id, qty) VALUES (?, ?, ?)');
-      for (const r of resolveItems(db, userId, input.items ?? [])) ins.run(orderNo, r.product_id, r.qty);
-      db.prepare("UPDATE taobao_orders SET fake = 1, actual_state = 'confirmed' WHERE order_no = ?").run(orderNo);
-    } else {
-      // 取消刷单：回到按下单商品算；有备注的要重新核对实发
-      db.prepare("UPDATE taobao_orders SET fake = 0, actual_state = CASE WHEN remark != '' THEN '' ELSE actual_state END WHERE order_no = ?").run(orderNo);
-    }
-    const updated = db.prepare('SELECT * FROM taobao_orders WHERE order_no = ?').get(orderNo) as any;
-    const docs = db
-      .prepare(
-        `SELECT DISTINCT s.sale_doc_id AS id FROM taobao_sub_orders s JOIN docs d ON d.id = s.sale_doc_id
-         WHERE s.order_no = ? AND d.status = 'active' ORDER BY s.sale_doc_id`,
-      )
-      .all(orderNo) as { id: number }[];
-    const rebuilt: number[] = [];
-    for (const d of docs) {
-      const subs = db.prepare('SELECT * FROM taobao_sub_orders WHERE sale_doc_id = ? ORDER BY sub_no').all(d.id) as unknown as SubRow[];
-      const postage = (db.prepare("SELECT COALESCE(SUM(amount), 0) v FROM doc_adjustments WHERE doc_id = ? AND name = '邮费'").get(d.id) as {
-        v: number;
-      }).v;
-      rebuilt.push(writeSale(db, userId, updated, subs, postage, d.id));
-    }
-    log(db, userId, 'taobao_fake', orderNo, { fake, items: input.items ?? [] });
+    const rows = input.as_ordered ? [] : resolveItems(db, userId, input.items ?? []);
+    const ins = db.prepare('INSERT INTO taobao_actual (order_no, product_id, qty) VALUES (?, ?, ?)');
+    for (const r of rows) ins.run(orderNo, r.product_id, r.qty);
+    db.prepare('UPDATE taobao_orders SET actual_state = ?, actual_custom = ? WHERE order_no = ?').run(
+      input.confirm === false ? 'draft' : 'confirmed',
+      input.as_ordered ? 0 : 1,
+      orderNo,
+    );
+    const after = actualOf(db, orderNo);
+    log(db, userId, 'taobao_actual', orderNo, { before: before.text, after: after.text, draft: input.confirm === false });
+    const rebuilt = rebuildOrder(db, userId, orderNo);
     const r = processTaobao(db, userId);
     return { ...r, rebuilt_sales: [...rebuilt, ...r.rebuilt_sales] };
   });
 }
+
+/** 订单的销售单上有没有确认退回来的货（有就不能再改实发） */
+const hasReturnedGoods = (db: DB, orderNo: string) =>
+  !!db
+    .prepare(
+      `SELECT 1 FROM docs r JOIN doc_items i ON i.doc_id = r.id JOIN docs s ON s.id = r.ref_doc_id
+       WHERE r.type = 'sale_return' AND r.status = 'active' AND i.qty > 0 AND s.source = 'taobao' AND s.source_ref = ? AND s.status = 'active'`,
+    )
+    .get(orderNo);
+
+/** 订单当前的实发（给日志和页面看） */
+function actualOf(db: DB, orderNo: string) {
+  const o = db.prepare('SELECT actual_custom FROM taobao_orders WHERE order_no = ?').get(orderNo) as { actual_custom: number };
+  const rows = productNames(db, db.prepare('SELECT product_id, qty FROM taobao_actual WHERE order_no = ? ORDER BY product_id').all(orderNo) as any[]);
+  const text = !o.actual_custom ? '按下单发' : rows.length ? rows.map((r) => `${r.name} ×${r.qty}`).join('、') : '空包';
+  return { custom: !!o.actual_custom, rows, text };
+}
+
+/** 按订单现在的实发，重建它已生成的全部销售单 */
+function rebuildOrder(db: DB, userId: number, orderNo: string): number[] {
+  const o = db.prepare('SELECT * FROM taobao_orders WHERE order_no = ?').get(orderNo) as any;
+  const docs = db
+    .prepare(
+      `SELECT DISTINCT s.sale_doc_id AS id FROM taobao_sub_orders s JOIN docs d ON d.id = s.sale_doc_id
+       WHERE s.order_no = ? AND d.status = 'active' ORDER BY s.sale_doc_id`,
+    )
+    .all(orderNo) as { id: number }[];
+  return docs.map((d) => {
+    const subs = db.prepare('SELECT * FROM taobao_sub_orders WHERE sale_doc_id = ? ORDER BY sub_no').all(d.id) as unknown as SubRow[];
+    return writeSale(db, userId, o, subs, postageOf(db, d.id), d.id);
+  });
+}
+
+const postageOf = (db: DB, docId: number) =>
+  (db.prepare("SELECT COALESCE(SUM(amount), 0) v FROM doc_adjustments WHERE doc_id = ? AND name = '邮费'").get(docId) as { v: number }).v;
 
 // ---------------------------------------------------------------- 生成单据
 
@@ -301,8 +421,11 @@ interface SubRow {
 export const UNMATCHED_PREFIX = '未匹配：';
 export const UNCHECKED_PREFIX = '待核对实发：';
 
-/** 订单的实发是否还没确定（有商家备注且没确认；刷单标记时已一并确认） */
-const actualPending = (o: any) => !o.fake && !!o.remark && o.actual_state !== 'confirmed';
+/** 未关联商品的货款行：计入销售额（空包、实发放在同订单另一张销售单上） */
+export const GOODS_PREFIX = '货款：';
+
+/** 订单的实发是否还没确定（有商家备注没核对，或只存了草稿） */
+const actualPending = (o: any) => o.actual_state === 'draft' || (!!o.remark && o.actual_state !== 'confirmed');
 
 const confirmedMap = (db: DB, s: SubRow) =>
   db
@@ -320,19 +443,22 @@ function buildSale(db: DB, o: any, subs: SubRow[]) {
     product_id: number;
     qty: number;
   }[];
-  if (o.fake) {
-    // 刷单：只有实际发出的商品扣库存（成本算刷单花费），钱全部记「刷单回款」
-    override.forEach((r) => items.push({ product_id: r.product_id, qty: r.qty, amount: 0 }));
-    const total = subs.reduce((t, x) => t + x.paid, 0);
-    if (total > 0) unresolved.push({ name: '刷单回款', amount: total });
-    return { items, unresolved: [], extra: unresolved };
-  }
+  const extra: { name: string; amount: number }[] = [];
   if (actualPending(o)) {
     for (const s of subs) unresolved.push({ name: `${UNCHECKED_PREFIX}${skuLabel(s.sku) || s.title} ×${s.qty}`, amount: s.paid });
-  } else if (override.length) {
+  } else if (o.actual_custom) {
+    // 实发按订单填，只挂在最先发货的那张销售单上；空包或同订单的其他销售单只记货款
+    const first = db
+      .prepare('SELECT sub_no FROM taobao_sub_orders WHERE order_no = ? AND shipped_at IS NOT NULL ORDER BY shipped_at, sub_no LIMIT 1')
+      .get(o.order_no) as { sub_no: string };
     const total = subs.reduce((t, x) => t + x.paid, 0);
-    const amounts = split(total, override.map((r) => weightOf(db, r.product_id) * r.qty));
-    override.forEach((r, i) => items.push({ product_id: r.product_id, qty: r.qty, amount: amounts[i] }));
+    const primary = subs.some((s) => s.sub_no === first.sub_no);
+    if (primary && override.length) {
+      const amounts = split(total, override.map((r) => weightOf(db, r.product_id) * r.qty));
+      override.forEach((r, i) => items.push({ product_id: r.product_id, qty: r.qty, amount: amounts[i] }));
+    } else {
+      extra.push({ name: `${GOODS_PREFIX}${primary ? '空包' : '实发见本订单首张销售单'}`, amount: total });
+    }
   } else {
     for (const s of subs) {
       const maps = confirmedMap(db, s);
@@ -344,14 +470,15 @@ function buildSale(db: DB, o: any, subs: SubRow[]) {
       maps.forEach((m, i) => items.push({ product_id: m.product_id, qty: s.qty * m.qty, amount: amounts[i], source_ref: s.sub_no }));
     }
   }
-  return { items, unresolved, extra: [] as { name: string; amount: number }[] };
+  return { items, unresolved, extra };
 }
 
 /** 这张（有未匹配项的）销售单现在是否能多确定一些商品 */
 function canResolveMore(db: DB, o: any, subs: SubRow[], docId: number): boolean {
-  if (o.fake || actualPending(o)) return false;
+  if (actualPending(o)) return false;
   const lines = db.prepare('SELECT name FROM doc_adjustments WHERE doc_id = ?').all(docId) as { name: string }[];
   if (lines.some((l) => l.name.startsWith(UNCHECKED_PREFIX))) return true; // 实发刚确认
+  if (o.actual_custom) return false;
   const withItems = new Set(
     (db.prepare('SELECT DISTINCT source_ref FROM doc_items WHERE doc_id = ?').all(docId) as { source_ref: string | null }[]).map(
       (r) => r.source_ref,
@@ -372,7 +499,6 @@ function writeSale(db: DB, userId: number, o: any, subs: SubRow[], postage: numb
     userId,
     {
       type: 'sale',
-      category: o.fake ? FAKE_CATEGORY : '',
       account_id: pub,
       doc_date: old ? old.doc_date : subs.map((s) => s.shipped_at!).sort()[0].slice(0, 10),
       channel: '淘宝',
@@ -438,11 +564,8 @@ export function processTaobao(db: DB, userId: number): ProcessResult {
     const o = orderOf(d.source_ref);
     const subs = subsOf(d.source_ref).filter((s) => s.sale_doc_id === d.id);
     if (!canResolveMore(db, o, subs, d.id)) continue;
-    const postage = (db.prepare("SELECT COALESCE(SUM(amount), 0) v FROM doc_adjustments WHERE doc_id = ? AND name = '邮费'").get(d.id) as {
-      v: number;
-    }).v;
     try {
-      res.rebuilt_sales.push(tx(db, () => writeSale(db, userId, o, subs, postage, d.id)));
+      res.rebuilt_sales.push(tx(db, () => writeSale(db, userId, o, subs, postageOf(db, d.id), d.id)));
     } catch (e: any) {
       res.errors.push(`订单 ${d.source_ref} 重建：${e.message}`);
     }
@@ -496,7 +619,7 @@ export function processTaobao(db: DB, userId: number): ProcessResult {
     // 子订单自己的明细 → 按实发填的（明细不分子订单）→ 都没有就是未匹配的，只退钱
     const lines = own.length
       ? own
-      : !actualPending(o) && db.prepare('SELECT 1 FROM taobao_actual WHERE order_no = ?').get(s.order_no)
+      : !actualPending(o) && o.actual_custom
         ? (db.prepare('SELECT id, amount FROM doc_items WHERE doc_id = ? ORDER BY id').all(s.sale_doc_id) as any[])
         : [];
     const amounts = split(s.refund, lines.map((l: { amount: number }) => l.amount || 1));
@@ -575,16 +698,15 @@ export function taobaoStatus(db: DB) {
     unmatched_orders: one("SELECT COUNT(*) n FROM docs WHERE type = 'sale' AND source = 'taobao' AND status = 'active' AND review = 'unmatched'"),
     unmatched_amount: one(
       `SELECT COALESCE(SUM(j.amount), 0) n FROM doc_adjustments j JOIN docs d ON d.id = j.doc_id
-       WHERE d.type = 'sale' AND d.source = 'taobao' AND d.status = 'active' AND (j.name LIKE ? OR j.name LIKE ?)`,
+       WHERE d.type = 'sale' AND d.source = 'taobao' AND d.status = 'active' AND d.review = 'unmatched' AND (j.name LIKE ? OR j.name LIKE ? OR j.name = '邮费')`,
       `${UNMATCHED_PREFIX}%`,
       `${UNCHECKED_PREFIX}%`,
     ),
     unchecked_orders: one(
-      `SELECT COUNT(*) n FROM taobao_orders o WHERE remark != '' AND actual_state != 'confirmed' AND fake = 0
+      `SELECT COUNT(*) n FROM taobao_orders o WHERE (actual_state = 'draft' OR (remark != '' AND actual_state != 'confirmed'))
        AND EXISTS (SELECT 1 FROM taobao_sub_orders s WHERE s.order_no = o.order_no AND s.shipped_at IS NOT NULL)`,
     ),
     to_ship: one('SELECT COUNT(*) n FROM taobao_orders WHERE status = ?', TB_TO_SHIP),
-    fake_orders: one('SELECT COUNT(*) n FROM taobao_orders WHERE fake = 1'),
     unconfirmed_sku: one('SELECT COUNT(DISTINCT item_id || sku) n FROM taobao_sku_map WHERE confirmed = 0'),
     pending_refunds: one("SELECT COUNT(*) n FROM docs WHERE type = 'sale_return' AND review = 'pending' AND status = 'active'"),
     last_import: (db.prepare("SELECT MAX(created_at) v FROM logs WHERE action = 'taobao_import'").get() as { v: string | null }).v,
@@ -599,12 +721,16 @@ const productNames = (db: DB, rows: { product_id: number; qty: number }[]) =>
 
 /** SKU 对照表：每个淘宝 SKU、卖了多少、对应到哪些商品 */
 export function listSkus(db: DB) {
+  // 卖过的 SKU 和商品清单里还没卖过的 SKU 一起列（没卖过的 lines = 0）
   const skus = db
     .prepare(
-      `SELECT item_id, sku, MAX(title) AS title, COUNT(*) AS lines, SUM(qty) AS qty,
-              SUM(CASE WHEN shipped_at IS NOT NULL AND NOT EXISTS (
-                SELECT 1 FROM taobao_sku_map m WHERE m.item_id = s.item_id AND m.sku = s.sku AND m.confirmed = 1) THEN 1 ELSE 0 END) AS waiting
-       FROM taobao_sub_orders s GROUP BY item_id, sku ORDER BY waiting DESC, lines DESC`,
+      `SELECT a.item_id, a.sku, a.title,
+              (SELECT COUNT(*) FROM taobao_sub_orders s WHERE s.item_id = a.item_id AND s.sku = a.sku) AS lines,
+              (SELECT COALESCE(SUM(qty), 0) FROM taobao_sub_orders s WHERE s.item_id = a.item_id AND s.sku = a.sku) AS qty,
+              (SELECT COUNT(*) FROM taobao_sub_orders s WHERE s.item_id = a.item_id AND s.sku = a.sku AND s.shipped_at IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM taobao_sku_map m WHERE m.item_id = s.item_id AND m.sku = s.sku AND m.confirmed = 1)) AS waiting,
+              EXISTS (SELECT 1 FROM taobao_skus k WHERE k.item_id = a.item_id AND k.sku = a.sku) AS listed
+       FROM (${ALL_SKUS}) a ORDER BY waiting DESC, lines DESC, a.item_id, a.sku`,
     )
     .all() as any[];
   return skus.map((s) => {
@@ -612,20 +738,22 @@ export function listSkus(db: DB) {
       s.item_id,
       s.sku,
     ) as any[];
+    const state = !maps.length ? 'none' : maps.every((m) => m.confirmed) ? 'confirmed' : 'auto';
     return {
       ...s,
       label: skuLabel(s.sku),
-      state: !maps.length ? 'none' : maps.every((m) => m.confirmed) ? 'confirmed' : 'auto',
+      state,
       products: productNames(db, maps),
+      suggestions: state === 'confirmed' ? [] : suggest(db, s.title, s.sku),
     };
   });
 }
 
-/** 有商家备注、实发还没确认的已发货订单 */
+/** 实发还没确定（有商家备注没核对 / 草稿）的已发货订单 */
 export function listActual(db: DB) {
   const orders = db
     .prepare(
-      `SELECT o.* FROM taobao_orders o WHERE o.remark != '' AND o.actual_state != 'confirmed' AND o.fake = 0 AND EXISTS (
+      `SELECT o.* FROM taobao_orders o WHERE (o.actual_state = 'draft' OR (o.remark != '' AND o.actual_state != 'confirmed')) AND EXISTS (
          SELECT 1 FROM taobao_sub_orders s WHERE s.order_no = o.order_no AND s.shipped_at IS NOT NULL)
        ORDER BY o.shipped_at`,
     )
@@ -636,6 +764,7 @@ export function listActual(db: DB) {
       (s) => ({ ...s, label: skuLabel(s.sku) }),
     ),
     actual: productNames(db, db.prepare('SELECT product_id, qty FROM taobao_actual WHERE order_no = ?').all(o.order_no) as any[]),
+    suggestions: suggest(db, o.remark, ''),
   }));
 }
 
@@ -647,26 +776,8 @@ export function listUnmatched(db: DB) {
        WHERE d.type = 'sale' AND d.source = 'taobao' AND d.status = 'active' AND d.review = 'unmatched' ORDER BY d.doc_date, d.id`,
     )
     .all() as any[];
-  const lines = db.prepare('SELECT name, amount FROM doc_adjustments WHERE doc_id = ? AND (name LIKE ? OR name LIKE ?) ORDER BY id');
+  const lines = db.prepare("SELECT name, amount FROM doc_adjustments WHERE doc_id = ? AND (name LIKE ? OR name LIKE ? OR name = '邮费') ORDER BY id");
   return docs.map((d) => ({ ...d, lines: lines.all(d.id, `${UNMATCHED_PREFIX}%`, `${UNCHECKED_PREFIX}%`) }));
-}
-
-/** 买家已付款、还没发货的订单 */
-export function listToShip(db: DB) {
-  const orders = db.prepare('SELECT * FROM taobao_orders WHERE status = ? ORDER BY paid_at').all(TB_TO_SHIP) as any[];
-  return orders.map((o) => ({
-    ...o,
-    subs: (db.prepare('SELECT sub_no, item_id, sku, title, qty, paid FROM taobao_sub_orders WHERE order_no = ?').all(o.order_no) as any[]).map(
-      (s) => ({
-        ...s,
-        label: skuLabel(s.sku),
-        products: productNames(
-          db,
-          db.prepare('SELECT product_id, qty FROM taobao_sku_map WHERE item_id = ? AND sku = ?').all(s.item_id, s.sku) as any[],
-        ),
-      }),
-    ),
-  }));
 }
 
 /** 待确认的退款（导入自动生成的仅退款） */
@@ -688,3 +799,81 @@ export function confirmRefundOnly(db: DB, userId: number, docId: number) {
   log(db, userId, 'confirm_refund_only', `doc:${docId}`);
 }
 
+
+/** 订单列表的分组（按淘宝订单状态） */
+export const ORDER_GROUPS: Record<string, string> = {
+  to_ship: `status = '${TB_TO_SHIP}'`,
+  shipped: `(status LIKE '卖家已发货%' OR status LIKE '卖家部分发货%')`,
+  success: `status = '${TB_SUCCESS}'`,
+  closed: `status LIKE '交易关闭%'`,
+  other: `status NOT IN ('${TB_TO_SHIP}', '${TB_SUCCESS}') AND status NOT LIKE '卖家已发货%' AND status NOT LIKE '卖家部分发货%' AND status NOT LIKE '交易关闭%'`,
+};
+
+/** 淘宝订单列表：按分组 / 订单号或商品关键字筛，最新的在前 */
+export function listOrders(db: DB, opts: { group?: string; q?: string; offset?: number }) {
+  const where = [ORDER_GROUPS[opts.group ?? ''] ?? '1 = 1'];
+  const params: string[] = [];
+  if (opts.q?.trim()) {
+    where.push(`(o.order_no LIKE ? OR o.remark LIKE ? OR EXISTS (SELECT 1 FROM taobao_sub_orders s WHERE s.order_no = o.order_no AND (s.title LIKE ? OR s.sku LIKE ?)))`);
+    const q = `%${opts.q.trim()}%`;
+    params.push(q, q, q, q);
+  }
+  const orders = db
+    .prepare(
+      `SELECT o.* FROM taobao_orders o WHERE ${where.join(' AND ')}
+       ORDER BY COALESCE(o.shipped_at, o.paid_at, o.created_at) DESC, o.order_no DESC LIMIT 50 OFFSET ?`,
+    )
+    .all(...params, opts.offset ?? 0) as any[];
+  const counts = Object.fromEntries(
+    Object.entries(ORDER_GROUPS).map(([k, cond]) => [k, (db.prepare(`SELECT COUNT(*) n FROM taobao_orders WHERE ${cond}`).get() as { n: number }).n]),
+  );
+  return {
+    counts,
+    items: orders.map((o) => ({
+      ...o,
+      subs: (db.prepare('SELECT * FROM taobao_sub_orders WHERE order_no = ? ORDER BY sub_no').all(o.order_no) as any[]).map((s) => ({
+        sub_no: s.sub_no,
+        title: s.title,
+        qty: s.qty,
+        paid: s.paid,
+        refund_status: s.refund_status,
+        label: skuLabel(s.sku),
+        products: productNames(db, confirmedMap(db, s)),
+      })),
+      actual_text: actualOf(db, o.order_no).text,
+    })),
+  };
+}
+
+/** 订单详情：子订单（含对照的商品）、实发、生成的销售单和退款、修改记录 */
+export function getOrder(db: DB, orderNo: string) {
+  const o = db.prepare('SELECT * FROM taobao_orders WHERE order_no = ?').get(orderNo) as any;
+  if (!o) return null;
+  const subs = (db.prepare('SELECT * FROM taobao_sub_orders WHERE order_no = ? ORDER BY sub_no').all(orderNo) as any[]).map((s) => ({
+    ...s,
+    label: skuLabel(s.sku),
+    products: productNames(db, confirmedMap(db, s)),
+    suggestions: confirmedMap(db, s).length ? [] : suggest(db, s.title, s.sku),
+  }));
+  const docs = db
+    .prepare(
+      `SELECT id, type, doc_date, amount, status, review, received FROM docs
+       WHERE source = 'taobao' AND source_ref = ? ORDER BY id`,
+    )
+    .all(orderNo);
+  const logs = db
+    .prepare(
+      `SELECT l.created_at, l.detail, u.name AS user_name FROM logs l LEFT JOIN users u ON u.id = l.user_id
+       WHERE l.action = 'taobao_actual' AND l.target = ? ORDER BY l.id DESC`,
+    )
+    .all(orderNo);
+  return {
+    order: { ...o, pending: actualPending(o) },
+    subs,
+    actual: actualOf(db, orderNo),
+    remark_suggestions: o.remark ? suggest(db, o.remark, '') : [],
+    docs,
+    logs,
+    returned: hasReturnedGoods(db, orderNo),
+  };
+}

@@ -19,6 +19,18 @@ interface Move {
   created_by_name: string;
 }
 
+interface Purchase {
+  doc_id: number;
+  type: DocType;
+  doc_date: string;
+  counterparty: string;
+  channel: string;
+  qty: number;
+  /** 这一行的实付成本（优惠 / 运费已摊入） */
+  cost: number;
+  account_name: string | null;
+}
+
 export function ProductEditPage() {
   const { id } = useParams();
   const [params] = useSearchParams();
@@ -82,7 +94,7 @@ export function ProductEditPage() {
 export default function ProductDetail() {
   const { id } = useParams();
   const nav = useNavigate();
-  const [data, setData] = useState<{ product: Product; moves: Move[] } | null>(null);
+  const [data, setData] = useState<{ product: Product; moves: Move[]; purchases: Purchase[] } | null>(null);
 
   useEffect(() => {
     get(`/api/products/${id}`).then(setData);
@@ -135,6 +147,26 @@ export default function ProductDetail() {
           盘点
         </Button>
       </div>
+      {data.purchases.length > 0 && (
+        <List header={`进货记录 · 实付单价（优惠、运费已摊入）· 最近进价 ${money(Math.round(data.purchases[0].cost / data.purchases[0].qty))}`}>
+          {data.purchases.map((x, i) => (
+            <List.Item
+              key={`${x.doc_id}-${i}`}
+              onClick={() => nav(`/docs/${x.doc_id}`)}
+              description={[x.type === 'opening_stock' ? '期初库存' : '', x.counterparty || x.channel, x.account_name ? `${x.account_name}付` : '']
+                .filter(Boolean)
+                .join(' · ')}
+              extra={
+                <span>
+                  {x.qty} 件 × <b>{money(Math.round(x.cost / x.qty))}</b>
+                </span>
+              }
+            >
+              {x.doc_date}
+            </List.Item>
+          ))}
+        </List>
+      )}
       <List header="出入库记录">
         {data.moves.map((m) => (
           <List.Item

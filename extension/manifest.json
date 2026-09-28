@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "小库存 · 淘宝助手",
+  "version": "0.1.0",
+  "description": "用你浏览器里的千牛登录态，每天导出订单报表、按需拉取商品 SKU，上传到小库存。",
+  "permissions": ["alarms", "storage", "scripting", "tabs", "cookies", "notifications"],
+  "host_permissions": [
+    "https://*.taobao.com/*",
+    "https://kucun.kidslearnenglish.xyz/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_popup": "popup.html", "default_title": "小库存 · 淘宝助手" },
+  "icons": { "128": "icon.png" }
+}

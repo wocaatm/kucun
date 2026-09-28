@@ -41,6 +41,9 @@ export default function Me() {
         <List.Item onClick={() => nav('/taobao?tab=import')} arrow description="每天导入千牛导出的两张订单表：生成销售、应收、退款">
           淘宝订单导入
         </List.Item>
+        <List.Item onClick={() => nav('/plugin')} arrow description="装在电脑 Chrome 里，每天自动导出千牛订单，按需拉取商品 SKU">
+          淘宝插件
+        </List.Item>
         <List.Item onClick={() => nav('/opening')} arrow description="期初资金、期初垫付、期初库存">
           期初设置
         </List.Item>

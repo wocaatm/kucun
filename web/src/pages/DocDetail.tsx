@@ -1,10 +1,9 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Button, Dialog, Input, List, NavBar, Popup, Selector, Tag, TextArea, Toast } from 'antd-mobile';
+import { Button, Dialog, Input, List, NavBar, Selector, Tag, TextArea, Toast } from 'antd-mobile';
 import { api, docMoneySign, get, money, post, type Doc, type Upload } from '../api';
 import { useSession } from '../store';
 import ImagePicker from '../components/ImagePicker';
-import ProductsEditor from '../components/ProductsEditor';
 import { DateField } from '../components/fields';
 import { docTitle } from './Docs';
 
@@ -12,7 +11,6 @@ export default function DocDetail() {
   const { id } = useParams();
   const nav = useNavigate();
   const { meta, refreshMeta } = useSession();
-  const [fakeEditing, setFakeEditing] = useState(false);
   const [doc, setDoc] = useState<Doc | null>(null);
   const [note, setNote] = useState('');
   const [editing, setEditing] = useState(false);
@@ -74,23 +72,6 @@ export default function DocDetail() {
     } catch (e: any) {
       Toast.show({ content: e.message, icon: 'fail' });
     }
-  };
-
-  const setFake = async (fake: boolean, items: { product_id: number; qty: number }[] = []) => {
-    const r = await api<{ result: { rebuilt_sales: number[]; errors: string[] } }>('PUT', `/api/taobao/orders/${doc.source_ref}/fake`, {
-      fake,
-      items: items.map((i) => ({ product_id: i.product_id, qty: i.qty })),
-    });
-    if (r.result.errors.length) Toast.show({ content: r.result.errors.join('；'), icon: 'fail' });
-    refreshMeta();
-    const next = r.result.rebuilt_sales[0];
-    Toast.show(fake ? '已标记为刷单' : '已取消刷单');
-    if (next) nav(`/docs/${next}`, { replace: true });
-  };
-
-  const unFake = async () => {
-    const ok = await Dialog.confirm({ content: '取消刷单？这单会重新按正常销售算销售额和库存。' });
-    if (ok) await setFake(false);
   };
 
   const refundOnly = async () => {
@@ -195,26 +176,14 @@ export default function DocDetail() {
         )}
       </List>
 
-      {doc.category === '刷单' && doc.type === 'sale' && doc.status === 'active' && (
-        <div className="card pending-card">
-          <div className="muted small">
-            这单是刷单：不算销售额；淘宝打过来的钱记「刷单回款」，冲抵支出里的刷单返款。
-            {doc.items!.length ? '实际寄出的商品扣了库存，成本算刷单花费。' : '空包，没扣库存。'}
-          </div>
-          <Button size="small" fill="outline" onClick={unFake}>
-            不是刷单，取消标记
-          </Button>
-        </div>
-      )}
-
       {doc.review === 'unmatched' && doc.status === 'active' && (
         <div className="card pending-card">
           <div className="warn-text">
             这单有商品没对上：{doc.adjustments!.filter((x) => x.name.startsWith('未匹配') || x.name.startsWith('待核对')).map((x) => x.name).join('、')}。
             这部分只记了金额，没扣库存、没算成本。
           </div>
-          <Button size="small" color="primary" onClick={() => nav('/taobao?tab=todo')}>
-            去对照商品 / 核对实发
+          <Button size="small" color="primary" onClick={() => nav(`/taobao/orders/${doc.source_ref}`)}>
+            去看订单 / 核对实发
           </Button>
         </div>
       )}
@@ -308,24 +277,13 @@ export default function DocDetail() {
         </List>
       )}
 
-      {doc.type === 'sale' && doc.source === 'taobao' && doc.status === 'active' && doc.category !== '刷单' && (
+      {doc.type === 'sale' && doc.source === 'taobao' && doc.status === 'active' && (
         <div style={{ padding: '12px 16px 0' }}>
-          <Button block fill="outline" onClick={() => setFakeEditing(true)}>
-            标记为刷单
+          <Button block fill="outline" onClick={() => nav(`/taobao/orders/${doc.source_ref}`)}>
+            淘宝订单 · 改实发商品（刷单空包、改发别的）
           </Button>
         </div>
       )}
-      <Popup visible={fakeEditing} onMaskClick={() => setFakeEditing(false)} bodyStyle={{ maxHeight: '85vh', overflow: 'auto' }} destroyOnClose>
-        <ProductsEditor
-          title="标记为刷单"
-          hint="实际寄出了什么？空包就什么都不加，直接保存。只有这里填的商品扣库存。"
-          initial={[]}
-          allowEmpty
-          saveText="确认是刷单"
-          onClose={() => setFakeEditing(false)}
-          onSave={(items) => setFake(true, items)}
-        />
-      </Popup>
 
       {returnable && (
         <div style={{ padding: '12px 16px 0' }}>

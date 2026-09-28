@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Badge, Button, Dialog, Empty, List, NavBar, Popup, Tabs, Tag, Toast } from 'antd-mobile';
+import { Badge, Button, CapsuleTabs, Dialog, Empty, List, NavBar, Popup, SearchBar, Tabs, Tag, Toast } from 'antd-mobile';
 import { api, get, money, post, type TaobaoOrder } from '../api';
 import { useSession } from '../store';
-import ProductsEditor, { type PickedProduct } from '../components/ProductsEditor';
+import ProductsEditor, { pickedToInput, type PickedProduct, type Suggestion } from '../components/ProductsEditor';
 
 
 interface Sku {
@@ -16,6 +16,7 @@ interface Sku {
   waiting: number;
   state: 'none' | 'auto' | 'confirmed';
   products: PickedProduct[];
+  suggestions: Suggestion[];
 }
 
 interface ActualOrder extends TaobaoOrder {
@@ -23,9 +24,18 @@ interface ActualOrder extends TaobaoOrder {
   actual: PickedProduct[];
 }
 
-interface ToShip extends TaobaoOrder {
-  subs: { sub_no: string; label: string; qty: number; paid: number; products: PickedProduct[] }[];
+interface ListedOrder extends TaobaoOrder {
+  subs: { sub_no: string; label: string; title: string; qty: number; paid: number; refund_status: string; products: PickedProduct[] }[];
+  actual_text: string;
 }
+
+const GROUPS = [
+  { key: 'to_ship', title: '待发货' },
+  { key: 'shipped', title: '已发货' },
+  { key: 'success', title: '交易成功' },
+  { key: 'closed', title: '已关闭' },
+  { key: 'other', title: '其他' },
+];
 
 interface Overview {
   status: {
@@ -46,7 +56,6 @@ interface Overview {
   skus: Sku[];
   actual: ActualOrder[];
   unmatched: { id: number; doc_date: string; source_ref: string; amount: number; remark: string | null; lines: { name: string; amount: number }[] }[];
-  to_ship: ToShip[];
   pending_refunds: { id: number; doc_date: string; amount: number; source_ref: string; item_summary: string }[];
 }
 
@@ -223,60 +232,23 @@ export default function TaobaoPage() {
             {s.title}
             <br />
             买家拍 1 件对应发出哪些商品、各几件（套装就加多个）
+            {s.state === 'auto' && (
+              <>
+                <br />
+                <b>下面是系统猜的，确认前不扣库存、不算利润。</b>
+              </>
+            )}
           </>
         }
         initial={s.products}
+        suggestions={s.suggestions}
         onClose={() => setEditor(null)}
         onSave={async (items) =>
           afterChange(
             await api('PUT', '/api/taobao/sku-map', {
               item_id: s.item_id,
               sku: s.sku,
-              items: items.map((i) => ({ product_id: i.product_id, qty: i.qty })),
-            }),
-          )
-        }
-      />,
-    );
-
-  const editActual = (o: ActualOrder) =>
-    setEditor(
-      <ProductsEditor
-        title={`订单 ${o.order_no}`}
-        hint={
-          <>
-            备注：<b>{o.remark}</b>
-            <br />
-            下单：{o.subs.map((s) => `${s.label} ×${s.qty}`).join('、')}
-            <br />
-            填实际发出的商品；售价按商品参考价比例分摊。
-          </>
-        }
-        initial={o.actual}
-        onClose={() => setEditor(null)}
-        extra={
-          <Button
-            block
-            fill="none"
-            style={{ marginTop: 8 }}
-            onClick={async () => {
-              const ok = await Dialog.confirm({ content: '备注和实发无关，就按下单的商品发的？' });
-              if (!ok) return;
-              try {
-                afterChange(await api('PUT', `/api/taobao/orders/${o.order_no}/actual`, { as_ordered: true }));
-                setEditor(null);
-              } catch (e: any) {
-                Toast.show({ content: e.message, icon: 'fail' });
-              }
-            }}
-          >
-            按下单的商品发（备注和实发无关）
-          </Button>
-        }
-        onSave={async (items) =>
-          afterChange(
-            await api('PUT', `/api/taobao/orders/${o.order_no}/actual`, {
-              items: items.map((i) => ({ product_id: i.product_id, qty: i.qty })),
+              items: pickedToInput(items),
             }),
           )
         }
@@ -297,13 +269,14 @@ export default function TaobaoPage() {
       <NavBar onBack={() => nav(-1)}>淘宝订单</NavBar>
       <Tabs activeKey={tab} onChange={(k) => setParams({ tab: k }, { replace: true })}>
         <Tabs.Tab title={<Badge content={todoCount || null}>待办</Badge>} key="todo" />
+        <Tabs.Tab title="订单" key="orders" />
         <Tabs.Tab title="导入" key="import" />
         <Tabs.Tab title="SKU 对照" key="sku" />
         <Tabs.Tab title="应收" key="due" />
-        <Tabs.Tab title="待发货" key="ship" />
       </Tabs>
 
       {tab === 'import' && <ImportTab onDone={load} />}
+      {tab === 'orders' && <OrdersTab group={params.get('group') ?? 'shipped'} onGroup={(g) => setParams({ tab: 'orders', group: g }, { replace: true })} />}
 
       {data && tab === 'todo' && (
         <>
@@ -315,7 +288,7 @@ export default function TaobaoPage() {
                 <List.Item
                   key={u.id}
                   arrow
-                  onClick={() => nav(`/docs/${u.id}`)}
+                  onClick={() => nav(`/taobao/orders/${u.source_ref}`)}
                   description={
                     <>
                       {u.lines.map((l) => (
@@ -348,7 +321,7 @@ export default function TaobaoPage() {
                 <List.Item
                   key={o.order_no}
                   arrow
-                  onClick={() => editActual(o)}
+                  onClick={() => nav(`/taobao/orders/${o.order_no}`)}
                   description={
                     <>
                       <div>下单：{o.subs.map((s) => `${s.label} ×${s.qty}`).join('、')}</div>
@@ -430,37 +403,79 @@ export default function TaobaoPage() {
         </>
       )}
 
-      {data && tab === 'ship' && (
-        <>
-          {!data.to_ship.length && <Empty description="没有待发货的订单" />}
-          <List>
-            {data.to_ship.map((o) => (
-              <List.Item
-                key={o.order_no}
-                description={
-                  <>
-                    {o.subs.map((s) => (
-                      <div key={s.sub_no}>
-                        {s.label} ×{s.qty}
-                        {s.products.length > 0 && <span className="muted"> → {productsText(s.products)}（库存 {s.products.map((p) => p.stock_qty).join('/')}）</span>}
-                      </div>
-                    ))}
-                    {o.remark && <div className="warn-text">备注：{o.remark}</div>}
-                  </>
-                }
-                extra={money(o.paid)}
-              >
-                付款 {o.paid_at?.slice(5, 16)}
-              </List.Item>
-            ))}
-          </List>
-        </>
-      )}
-
       <Popup visible={!!editor} onMaskClick={() => setEditor(null)} bodyStyle={{ maxHeight: '85vh', overflow: 'auto' }} destroyOnClose>
         {editor}
       </Popup>
     </div>
+  );
+}
+
+function OrdersTab({ group, onGroup }: { group: string; onGroup: (g: string) => void }) {
+  const nav = useNavigate();
+  const [q, setQ] = useState('');
+  const [data, setData] = useState<{ counts: Record<string, number>; items: ListedOrder[] } | null>(null);
+  const [more, setMore] = useState(false);
+
+  const load = useCallback(
+    async (offset = 0) => {
+      const r = await get<{ counts: Record<string, number>; items: ListedOrder[] }>(
+        `/api/taobao/orders?group=${group}&q=${encodeURIComponent(q)}&offset=${offset}`,
+      );
+      setData((d) => (offset && d ? { counts: r.counts, items: [...d.items, ...r.items] } : r));
+      setMore(r.items.length === 50);
+    },
+    [group, q],
+  );
+  useEffect(() => {
+    load().catch((e) => Toast.show(e.message));
+  }, [load]);
+
+  return (
+    <>
+      <CapsuleTabs activeKey={group} onChange={onGroup}>
+        {GROUPS.map((g) => (
+          <CapsuleTabs.Tab key={g.key} title={`${g.title}${data?.counts[g.key] ? ` ${data.counts[g.key]}` : ''}`} />
+        ))}
+      </CapsuleTabs>
+      <div style={{ padding: '0 12px 8px' }}>
+        <SearchBar placeholder="搜订单号 / 商品 / 备注" onSearch={setQ} onClear={() => setQ('')} />
+      </div>
+      {data && !data.items.length && <Empty description="没有订单" />}
+      <List>
+        {data?.items.map((o) => (
+          <List.Item
+            key={o.order_no}
+            arrow
+            onClick={() => nav(`/taobao/orders/${o.order_no}`)}
+            description={
+              <>
+                {o.subs.map((s) => (
+                  <div key={s.sub_no}>
+                    {s.label || s.title} ×{s.qty}
+                    {s.refund_status === '退款成功' && <span className="down"> 已退款</span>}
+                    {group === 'to_ship' && s.products.length > 0 && (
+                      <span className="muted"> → {productsText(s.products)}（库存 {s.products.map((p) => p.stock_qty).join('/')}）</span>
+                    )}
+                  </div>
+                ))}
+                {o.actual_custom === 1 && <div>实发：{o.actual_text}</div>}
+                {o.remark && <div className="warn-text">备注：{o.remark}</div>}
+              </>
+            }
+            extra={money(o.paid)}
+          >
+            {(o.shipped_at ?? o.paid_at ?? '').slice(5, 16)} · {o.order_no.slice(-6)}
+          </List.Item>
+        ))}
+      </List>
+      {more && (
+        <div style={{ padding: 12 }}>
+          <Button block fill="none" onClick={() => load(data!.items.length)}>
+            加载更多
+          </Button>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -475,7 +490,7 @@ function SkuRow({ s, onClick }: { s: Sku; onClick: () => void }) {
           <div className="ellipsis">{s.title}</div>
           <div>{s.products.length ? `→ ${productsText(s.products)}` : '→ 未对应商品'}</div>
           <div>
-            卖出 {s.qty} 件{s.waiting > 0 ? ` · ${s.waiting} 行没扣库存` : ''}
+            {s.lines ? `卖出 ${s.qty} 件` : '还没卖过'}{s.waiting > 0 ? ` · ${s.waiting} 行没扣库存` : ''}
           </div>
         </>
       }

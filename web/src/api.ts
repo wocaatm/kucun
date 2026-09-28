@@ -157,6 +157,8 @@ export interface TaobaoOrder {
   remark: string;
   address: string;
   actual_state: string;
+  /** 1 = 按填的实发发货（没填商品就是空包），0 = 按下单的商品 */
+  actual_custom: number;
 }
 
 export interface Doc {

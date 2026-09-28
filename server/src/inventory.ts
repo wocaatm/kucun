@@ -20,7 +20,7 @@ interface Pending {
 }
 
 /**
- * 按录入顺序重放一个商品的全部有效明细，重新算出库存数量、库存金额，
+ * 按单据日期（同一天按录入顺序）重放一个商品的全部有效明细，重新算出库存数量、库存金额，
  * 以及每条出库明细结转的成本。
  *
  * 允许负库存：库存不足时卖出的件数记为「成本待定」，
@@ -33,7 +33,7 @@ export function replayProduct(db: DB, productId: number) {
       `SELECT i.id, i.qty, i.unit_price, i.amount, i.in_cost, d.type
        FROM doc_items i JOIN docs d ON d.id = i.doc_id
        WHERE i.product_id = ? AND d.status = 'active'
-       ORDER BY d.id, i.id`,
+       ORDER BY d.doc_date, d.id, i.id`,
     )
     .all(productId) as unknown as ReplayRow[];
 

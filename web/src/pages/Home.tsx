@@ -18,7 +18,6 @@ interface Profit {
   other_income: number;
   /** 没对上商品的淘宝订单行：暂不计入销售额和成本 */
   pending: { amount: number; orders: number };
-  fake: { expense: number; income: number; goods_cost: number; net_cost: number };
   investment: number;
   net: number;
   shares: { name: string; ratio: number; amount: number }[];
@@ -104,18 +103,6 @@ function ProfitRows({ p }: { p: Profit }) {
           <b>{loss > 0 ? '-' : '+'}{money(Math.abs(loss))}</b>
         </div>
       )}
-      {(p.fake.income !== 0 || p.fake.goods_cost !== 0) && (
-        <div>
-          <span>刷单回款</span>
-          <b>+{money(p.fake.income)}</b>
-        </div>
-      )}
-      {p.fake.goods_cost !== 0 && (
-        <div>
-          <span>刷单寄出商品成本</span>
-          <b>-{money(p.fake.goods_cost)}</b>
-        </div>
-      )}
       {p.other_income !== 0 && (
         <div>
           <span>其他收入</span>
@@ -129,12 +116,6 @@ function ProfitRows({ p }: { p: Profit }) {
       {p.expense_by_category.length > 0 && (
         <div className="kv-sub">
           支出：{p.expense_by_category.map((c) => `${c.category} ${money(c.amount)}`).join('，')}
-        </div>
-      )}
-      {p.fake.expense > 0 && (
-        <div className="kv-sub">
-          刷单净花费 {money(p.fake.net_cost)} = 返款 {money(p.fake.expense)} − 回款 {money(p.fake.income)}
-          {p.fake.goods_cost ? ` + 寄出商品 ${money(p.fake.goods_cost)}` : ''}
         </div>
       )}
       <div className="kv-sub">商品成本按实付算：进货单上的优惠、运费已按金额比例摊进每个商品</div>
@@ -154,7 +135,7 @@ function TaobaoCard({ data }: { data: Dashboard }) {
     t.unconfirmed_sku > 0 && { text: `${t.unconfirmed_sku} 个 SKU 待确认`, tab: 'sku' },
     t.unchecked_orders > 0 && { text: `${t.unchecked_orders} 单要核对实发`, tab: 'todo' },
     t.pending_refunds > 0 && { text: `${t.pending_refunds} 笔退款待确认`, tab: 'todo' },
-    t.to_ship > 0 && { text: `${t.to_ship} 单待发货`, tab: 'ship' },
+    t.to_ship > 0 && { text: `${t.to_ship} 单待发货`, tab: 'orders&group=to_ship' },
   ].filter(Boolean) as { text: string; tab: string }[];
   if (!t.last_import && !r.count) return null;
   return (

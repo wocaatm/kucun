@@ -1,5 +1,5 @@
 import type { DB } from './db.ts';
-import { FAKE_CATEGORY, LOW_STOCK_THRESHOLD, PROFIT_SHARES } from './settings.ts';
+import { LOW_STOCK_THRESHOLD, PROFIT_SHARES } from './settings.ts';
 import { UNMATCHED_PREFIX, UNCHECKED_PREFIX } from './taobao.ts';
 
 /**
@@ -55,20 +55,18 @@ export function profit(db: DB, month?: string) {
   const dateCond = month ? `AND d.doc_date LIKE ?` : '';
   const p = month ? [`${month}%`] : [];
 
-  // 刷单订单（销售单 category = 刷单）及其退款：不算销售额和卖出成本，单独算刷单净花费
-  const fakeSale = `COALESCE(CASE d.type WHEN 'sale' THEN d.category ELSE (SELECT s.category FROM docs s WHERE s.id = d.ref_doc_id) END, '') = '${FAKE_CATEGORY}'`;
-  const saleSum = (fake: boolean) =>
-    sum(
-      db,
-      `SELECT SUM(CASE type WHEN 'sale' THEN amount ELSE -amount END) v FROM docs d
-       WHERE status = 'active' AND type IN ('sale', 'sale_return') AND ${fake ? '' : 'NOT '}${fakeSale} ${dateCond}`,
-      p,
-    );
-  // 淘宝订单里没对上商品的行（未匹配 SKU / 待核对实发）：先不计入销售额和成本，确认后随重建计入
+  const sales = sum(
+    db,
+    `SELECT SUM(CASE type WHEN 'sale' THEN amount ELSE -amount END) v FROM docs d
+     WHERE status = 'active' AND type IN ('sale', 'sale_return') ${dateCond}`,
+    p,
+  );
+  // 淘宝订单里没对上商品的行（未匹配 SKU / 待核对实发）连同这单的邮费：先不计入销售额和成本，确认后随重建计入
   const pendingLines = sum(
     db,
     `SELECT SUM(j.amount) v FROM doc_adjustments j JOIN docs d ON d.id = j.doc_id
-     WHERE d.status = 'active' AND d.type = 'sale' AND d.review = 'unmatched' AND (j.name LIKE '${UNMATCHED_PREFIX}%' OR j.name LIKE '${UNCHECKED_PREFIX}%') ${dateCond}`,
+     WHERE d.status = 'active' AND d.type = 'sale' AND d.review = 'unmatched'
+       AND (j.name LIKE '${UNMATCHED_PREFIX}%' OR j.name LIKE '${UNCHECKED_PREFIX}%' OR j.name = '邮费') ${dateCond}`,
     p,
   );
   // 这些行上发生的退款（不关联商品的「退款：…」）同样先不计
@@ -83,20 +81,16 @@ export function profit(db: DB, month?: string) {
     orders: sum(db, `SELECT COUNT(*) v FROM docs d WHERE status = 'active' AND type = 'sale' AND review = 'unmatched' ${dateCond}`, p),
   };
   // 销售额 = 销售 − 退款 − 没对上的行；退货单按退货日期计入当月
-  const revenue = saleSum(false) - pending.amount;
-  const itemSum = (type: string, expr: string, fake: boolean | null = null) =>
+  const revenue = sales - pending.amount;
+  const itemSum = (type: string, expr: string) =>
     sum(
       db,
-      `SELECT SUM(${expr}) v FROM doc_items i JOIN docs d ON d.id = i.doc_id WHERE d.status = 'active' AND d.type = '${type}'
-       ${fake === null ? '' : `AND ${fake ? '' : 'NOT '}${fakeSale}`} ${dateCond}`,
+      `SELECT SUM(${expr}) v FROM doc_items i JOIN docs d ON d.id = i.doc_id WHERE d.status = 'active' AND d.type = '${type}' ${dateCond}`,
       p,
     );
   // 卖出成本扣掉退回入库的成本
-  const cogs = itemSum('sale', 'i.cost_amount', false) - itemSum('sale_return', 'i.cost_amount', false);
+  const cogs = itemSum('sale', 'i.cost_amount') - itemSum('sale_return', 'i.cost_amount');
   const costPendingUnits = itemSum('sale', 'i.cost_pending');
-  // 刷单：回款（淘宝打过来的钱，扣退款）、实际发出商品的成本；返款在支出「刷单」里
-  const fakeIncome = saleSum(true);
-  const fakeGoodsCost = itemSum('sale', 'i.cost_amount', true) - itemSum('sale_return', 'i.cost_amount', true);
   const outboundCost = itemSum('outbound', 'i.cost_amount');
   const stocktakeLoss = itemSum('stocktake', 'CASE WHEN i.qty < 0 THEN i.cost_amount ELSE -i.cost_amount END');
 
@@ -113,8 +107,7 @@ export function profit(db: DB, month?: string) {
   const otherIncome = incomeByCat.filter((r) => r.category !== '追加投资').reduce((s, r) => s + r.amount, 0);
   const investment = incomeByCat.filter((r) => r.category === '追加投资').reduce((s, r) => s + r.amount, 0);
 
-  const fakeExpense = expenseByCat.filter((r) => r.category === FAKE_CATEGORY).reduce((s, r) => s + r.amount, 0);
-  const net = revenue - cogs - expenses - outboundCost - stocktakeLoss + otherIncome + fakeIncome - fakeGoodsCost;
+  const net = revenue - cogs - expenses - outboundCost - stocktakeLoss + otherIncome;
   const users = db.prepare('SELECT username, name FROM users').all() as { username: string; name: string }[];
   const shares = Object.entries(PROFIT_SHARES).map(([username, ratio]) => ({
     name: users.find((u) => u.username === username)?.name ?? username,
@@ -132,8 +125,6 @@ export function profit(db: DB, month?: string) {
     outbound_cost: outboundCost,
     stocktake_loss: stocktakeLoss,
     other_income: otherIncome,
-    /** 刷单：返款（支出里的「刷单」）− 回款 + 发出商品成本 = 净花费 */
-    fake: { expense: fakeExpense, income: fakeIncome, goods_cost: fakeGoodsCost, net_cost: fakeExpense - fakeIncome + fakeGoodsCost },
     pending,
     investment,
     net,

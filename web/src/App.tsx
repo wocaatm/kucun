@@ -14,6 +14,8 @@ import Docs from './pages/Docs';
 import DocDetail from './pages/DocDetail';
 import ReturnPage from './pages/ReturnPage';
 import TaobaoPage from './pages/TaobaoPage';
+import TaobaoOrderPage from './pages/TaobaoOrderPage';
+import PluginPage from './pages/PluginPage';
 import Me, { BackupPage, LogsPage, OpeningPage, PasswordPage } from './pages/Me';
 
 // Excel 解析库较大，只在导入页按需加载
@@ -64,6 +66,8 @@ function Shell() {
         <Route path="/docs/:id" element={<DocDetail />} />
         <Route path="/docs/:id/return" element={<ReturnPage />} />
         <Route path="/taobao" element={<TaobaoPage />} />
+        <Route path="/taobao/orders/:no" element={<TaobaoOrderPage />} />
+        <Route path="/plugin" element={<PluginPage />} />
         <Route path="/me" element={<Me />} />
         <Route path="/opening" element={<OpeningPage />} />
         <Route path="/backup" element={<BackupPage />} />

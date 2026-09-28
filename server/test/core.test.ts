@@ -165,6 +165,43 @@ test('作废进货单后库存和成本回滚', async () => {
   await assert.rejects(api('POST', `/api/docs/${a.id}/void`, { reason: 'x' }), /已作废/);
 });
 
+test('成本按单据日期算：补录早几天的进货，之后的卖出成本跟着变；改日期后重算；商品页有进货记录', async () => {
+  const p = await product('日期测试品');
+  const pub = acc['公共资金'];
+  await api('POST', '/api/docs', { type: 'purchase', account_id: pub, doc_date: '2026-09-10', items: [{ product_id: p, qty: 1, unit_price: 2000 }] });
+  const { doc: sale } = await api('POST', '/api/docs', {
+    type: 'sale',
+    account_id: pub,
+    doc_date: '2026-09-05',
+    items: [{ product_id: p, qty: 1, unit_price: 3000 }],
+  });
+  // 9/5 卖出时还没货：成本待定，9/10 进货补上
+  assert.equal((await api('GET', `/api/docs/${sale.id}`)).doc.items[0].cost_amount, 2000);
+  // 补录 9/1 的进货：9/5 的卖出改按 9/1 的进价
+  const { doc: early } = await api('POST', '/api/docs', {
+    type: 'purchase',
+    account_id: pub,
+    doc_date: '2026-09-01',
+    counterparty: '奥乐齐',
+    items: [{ product_id: p, qty: 1, amount: 1000 }],
+    adjustments: [{ name: '运费', amount: 200 }],
+  });
+  assert.equal((await api('GET', `/api/docs/${sale.id}`)).doc.items[0].cost_amount, 1200);
+  assert.equal((await stock(p)).stock_value, 2000);
+  // 把它改到 9/8：9/5 又变成先卖后买，补的是 9/8 那批
+  await api('PATCH', `/api/docs/${early.id}`, { doc_date: '2026-09-08' });
+  assert.equal((await api('GET', `/api/docs/${sale.id}`)).doc.items[0].cost_amount, 1200);
+  await api('PATCH', `/api/docs/${early.id}`, { doc_date: '2026-09-09' });
+  const { purchases } = await api('GET', `/api/products/${p}`);
+  assert.deepEqual(
+    purchases.map((x: any) => [x.doc_date, x.qty, x.cost, x.counterparty]),
+    [
+      ['2026-09-10', 1, 2000, ''],
+      ['2026-09-09', 1, 1200, '奥乐齐'],
+    ],
+  );
+});
+
 test('盘点：少了计损耗，多了补回', async () => {
   const p = await product('洗发水');
   await api('POST', '/api/docs', { type: 'purchase', account_id: acc['公共资金'], items: [{ product_id: p, qty: 5, unit_price: 2000 }] });

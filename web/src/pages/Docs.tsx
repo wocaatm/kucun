@@ -28,7 +28,7 @@ const TYPE_ICON: Record<string, string> = {
 
 export function docTitle(d: Doc) {
   if (d.type === 'sale' && d.amount < 0) return '销售退款';
-  if (d.type === 'sale' && d.source === 'taobao') return d.category === '刷单' ? '淘宝刷单' : '淘宝销售';
+  if (d.type === 'sale' && d.source === 'taobao') return '淘宝销售';
   return `${DOC_LABEL[d.type]}${d.category ? ` · ${d.category}` : ''}`;
 }
 

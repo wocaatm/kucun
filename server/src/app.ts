@@ -11,7 +11,8 @@ import { createDoc, createReturn, voidDoc, getDoc, BizError, normalizeName, type
 import { accountBalances, settleSuggestions, profit, inventorySummary, capital, receivable } from './ledger.ts';
 import { readXlsx } from './xlsx.ts';
 import * as taobao from './taobao.ts';
-import { avgCost } from './inventory.ts';
+import * as agent from './agent.ts';
+import { avgCost, replayProduct } from './inventory.ts';
 import { recognizeImage, matchProduct, isSubsequence, type RecognizeMode } from './vision.ts';
 import { createBackup, listBackups } from './backup.ts';
 import { syncAldi } from './aldi.ts';
@@ -63,6 +64,13 @@ export function buildApp(opts: AppOptions) {
   app.addHook('preHandler', async (req, reply) => {
     const path = req.url.split('?')[0];
     if (!(path.startsWith('/api/') || path.startsWith('/files/')) || PUBLIC.has(path)) return;
+    // 淘宝插件：只认连接码，身份是生成连接码的人
+    if (path.startsWith('/api/agent/')) {
+      const u = agent.agentUser(db, req.headers.authorization?.replace(/^Bearer\s+/i, ''));
+      if (!u) return reply.status(401).send({ error: '连接码不对或已重置，请在「我的 → 淘宝插件」复制新的连接码' });
+      req.user = u;
+      return;
+    }
     const token = req.cookies.sid;
     const row = token
       ? (db
@@ -239,10 +247,19 @@ export function buildApp(opts: AppOptions) {
       .prepare(
         `SELECT i.*, d.type, d.category, d.doc_date, d.status, d.channel, u.name AS created_by_name
          FROM doc_items i JOIN docs d ON d.id = i.doc_id JOIN users u ON u.id = d.created_by
-         WHERE i.product_id = ? ORDER BY d.id DESC LIMIT 200`,
+         WHERE i.product_id = ? ORDER BY d.doc_date DESC, d.id DESC LIMIT 200`,
       )
       .all(id);
-    return { product: withAvg(p), moves };
+    // 进货记录：每次进了多少、实付单价（优惠 / 运费已摊进去）
+    const purchases = db
+      .prepare(
+        `SELECT d.id AS doc_id, d.type, d.doc_date, d.counterparty, d.channel, i.qty, COALESCE(i.in_cost, i.amount) AS cost, a.name AS account_name
+         FROM doc_items i JOIN docs d ON d.id = i.doc_id LEFT JOIN accounts a ON a.id = d.account_id
+         WHERE i.product_id = ? AND d.status = 'active' AND d.type IN ('purchase', 'opening_stock')
+         ORDER BY d.doc_date DESC, d.id DESC`,
+      )
+      .all(id);
+    return { product: withAvg(p), moves, purchases };
   });
 
   app.post('/api/products', async (req) => {
@@ -390,7 +407,7 @@ export function buildApp(opts: AppOptions) {
     return { doc: getDoc(db, id) };
   });
 
-  // 只允许改不影响金额和库存的字段：备注、图片、日期（库存按录入顺序算，改日期不影响）、支出 / 收入分类
+  // 只允许改不影响金额的字段：备注、图片、日期、支出 / 收入分类。成本按单据日期算，改日期后重算涉及的商品
   app.patch('/api/docs/:id', async (req) => {
     const id = Number((req.params as any).id);
     const { note, upload_ids, doc_date, category } = req.body as { note?: string; upload_ids?: number[]; doc_date?: string; category?: string };
@@ -400,7 +417,12 @@ export function buildApp(opts: AppOptions) {
     if (doc_date !== undefined) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(doc_date)) throw new BizError('日期格式不对');
       if (cur.source === 'taobao') throw new BizError('淘宝导入的单据日期按发货时间，不能改');
-      db.prepare('UPDATE docs SET doc_date = ? WHERE id = ?').run(doc_date, id);
+      tx(db, () => {
+        db.prepare('UPDATE docs SET doc_date = ? WHERE id = ?').run(doc_date, id);
+        for (const { product_id } of db.prepare('SELECT DISTINCT product_id FROM doc_items WHERE doc_id = ?').all(id) as { product_id: number }[]) {
+          replayProduct(db, product_id);
+        }
+      });
     }
     if (category !== undefined) {
       const cats = cur.type === 'expense' ? EXPENSE_CATEGORIES : cur.type === 'income' ? INCOME_CATEGORIES : null;
@@ -512,7 +534,11 @@ export function buildApp(opts: AppOptions) {
 
   // ---------- 淘宝订单 ----------
   /** 上传千牛导出的主订单表 + 子订单表（顺序随意，按表头识别）；dry=1 只试跑 */
-  app.post('/api/taobao/import', async (req) => {
+  app.post('/api/taobao/import', async (req) => importUpload(req));
+  // 插件上传的是同样两张表
+  app.post('/api/agent/orders', async (req) => importUpload(req));
+
+  async function importUpload(req: FastifyRequest) {
     const sheets: Record<string, Record<string, string>[]> = {};
     let dry = false;
     const saved: { name: string; buf: Buffer }[] = [];
@@ -541,7 +567,25 @@ export function buildApp(opts: AppOptions) {
       for (const f of saved) writeFileSync(join(dir, `${stamp}-${f.name.replace(/[^\w.-]/g, '_')}`), f.buf);
     }
     return { dry, report };
+  }
+
+  // ---------- 淘宝插件 ----------
+  app.get('/api/plugin', async () => agent.agentStatus(db));
+  app.post('/api/plugin/token', async (req) => ({ token: agent.resetToken(db, req.user.id) }));
+  app.post('/api/plugin/tasks', async (req) => {
+    const id = agent.createTask(db, req.user.id, String((req.body as any)?.kind ?? ''));
+    return { id, ...agent.agentStatus(db) };
   });
+  // 插件每分钟来一次：领任务（没有就是 null）
+  app.post('/api/agent/next', async () => ({ task: agent.nextTask(db) }));
+  app.post('/api/agent/tasks/:id', async (req) => {
+    const { ok, message } = (req.body ?? {}) as { ok?: boolean; message?: string };
+    agent.finishTask(db, Number((req.params as any).id), !!ok, message ?? '');
+    return { ok: true };
+  });
+  // 插件自己按时发起的任务也记一笔，页面上能看到
+  app.post('/api/agent/tasks', async (req) => ({ task: agent.startOwnTask(db, String((req.body as any)?.kind ?? '')) }));
+  app.post('/api/agent/skus', async (req) => ({ result: taobao.syncCatalog(db, req.user.id, ((req.body as any)?.items ?? []) as taobao.CatalogInput[]) }));
 
   app.get('/api/taobao/overview', async () => ({
     status: taobao.taobaoStatus(db),
@@ -549,7 +593,6 @@ export function buildApp(opts: AppOptions) {
     skus: taobao.listSkus(db),
     actual: taobao.listActual(db),
     unmatched: taobao.listUnmatched(db),
-    to_ship: taobao.listToShip(db),
     pending_refunds: taobao.listPendingRefunds(db),
   }));
 
@@ -560,9 +603,15 @@ export function buildApp(opts: AppOptions) {
 
   app.post('/api/taobao/sku-map/confirm-all', async (req) => ({ result: taobao.confirmAllSkus(db, req.user.id) }));
 
-  app.put('/api/taobao/orders/:no/fake', async (req) => {
-    const no = (req.params as any).no as string;
-    return { result: taobao.setFake(db, req.user.id, no, req.body as any) };
+  app.get('/api/taobao/orders', async (req) => {
+    const { group = '', q = '', offset = '0' } = req.query as Record<string, string>;
+    return taobao.listOrders(db, { group, q, offset: Number(offset) });
+  });
+
+  app.get('/api/taobao/orders/:no', async (req, reply) => {
+    const r = taobao.getOrder(db, (req.params as any).no as string);
+    if (!r) return reply.status(404).send({ error: '订单不存在' });
+    return r;
   });
 
   app.put('/api/taobao/orders/:no/actual', async (req) => {
