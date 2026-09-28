@@ -84,7 +84,8 @@ export class Taobao {
    * 先由插件后台直接请求（有淘宝域名权限，不受跨域限制，带浏览器里的登录 cookie）；不行再从千牛页面里请求。
    */
   async download(x) {
-    const q = new URLSearchParams({
+    // 和千牛页面一样用 %20 编码空格；URLSearchParams 会编成 +，淘宝不认，返回错误页
+    const q = Object.entries({
       f_p: x.orderEncrypterStr,
       apply_time: x.applyTime,
       start_time: x.startTimeStr,
@@ -92,7 +93,9 @@ export class Taobao {
       order_status: x.orderStatus ?? '全部',
       export_id: x.exportId,
       isQnNew: 'true',
-    });
+    })
+      .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+      .join('&');
     const url = `https://trade.taobao.com/trade/itemlist/export_by_tfs.do?${q}`;
     const errors = [];
     try {
@@ -142,7 +145,13 @@ export class Taobao {
 
 // xlsx 是 zip，开头是 PK
 const isXlsx = (buf) => buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b;
-const preview = (buf) => new TextDecoder().decode(buf.slice(0, 120)).replace(/\s+/g, ' ');
+/** 返回的不是文件时，给出网页标题和正文开头，方便看出原因（淘宝页面是 GBK） */
+function preview(buf) {
+  const html = new TextDecoder('gbk').decode(buf.slice(0, 20000));
+  const title = html.match(/<title>([^<]*)<\/title>/i)?.[1]?.trim() ?? '';
+  const body = html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<[^>]+>/gi, ' ').replace(/\s+/g, ' ').trim();
+  return `「${title}」${body.slice(0, 150)}`;
+}
 function toBase64(bytes) {
   let bin = '';
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
