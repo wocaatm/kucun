@@ -83,7 +83,7 @@ async function stepOrders(tb, job) {
   if (Date.now() - job.startedAt > ORDER_TIMEOUT) throw new Error('等报表生成超时');
   if (job.step === 'start') {
     const list = await tb.exportList();
-    // 千牛上已有刚生成、还没导入过的两份报表（比如上次下载失败），直接用，不再等 7 分钟
+    // 千牛上 30 分钟内刚生成、插件还没导入过的两份报表（比如上次下载失败），直接用，不再等 7 分钟
     const reuse = await reusable(list);
     if (reuse) {
       await log('千牛上已有刚生成的两份报表，直接下载');
@@ -110,14 +110,14 @@ async function stepOrders(tb, job) {
   return upload(tb, orders, items);
 }
 
-/** 最新的订单报表和宝贝明细报表都生成好、3 小时内申请的、还没导入过 */
+/** 最新的订单报表和宝贝明细报表都生成好、30 分钟内申请的、还没导入过（再旧就重新导出，保证拿到最新订单） */
 async function reusable(list) {
   const done = await store.get('uploaded', []);
   const newest = (type) => list.find((x) => String(x.exportType) === type);
   const [orders, items] = [newest('1'), newest('2')];
   const fresh = (x) =>
     x && x.exportStatus === 'exportSuccess' && !done.includes(String(x.exportId)) &&
-    Date.now() - Date.parse(`${x.applyTime.replace(' ', 'T')}+08:00`) < 3 * 3600 * 1000;
+    Date.now() - Date.parse(`${x.applyTime.replace(' ', 'T')}+08:00`) < 30 * 60 * 1000;
   return fresh(orders) && fresh(items) ? { orders, items } : null;
 }
 
