@@ -1090,3 +1090,11 @@ body {
   padding: 8px 12px 12px;
   background: var(--card);
 }
+
+/* 列表项：长描述只截断，不把右侧金额挤出屏幕 */
+.adm-list-item-content-main {
+  min-width: 0;
+}
+.adm-list-item-content-extra {
+  flex-shrink: 0;
+}
