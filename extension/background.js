@@ -82,7 +82,14 @@ async function runSkus(tb) {
 async function stepOrders(tb, job) {
   if (Date.now() - job.startedAt > ORDER_TIMEOUT) throw new Error('等报表生成超时');
   if (job.step === 'start') {
-    job.before = (await tb.exportList()).map((x) => String(x.exportId));
+    const list = await tb.exportList();
+    // 千牛上已有刚生成、还没导入过的两份报表（比如上次下载失败），直接用，不再等 7 分钟
+    const reuse = await reusable(list);
+    if (reuse) {
+      await log('千牛上已有刚生成的两份报表，直接下载');
+      return upload(tb, reuse.orders, reuse.items);
+    }
+    job.before = list.map((x) => String(x.exportId));
     await tb.applyExport(1);
     Object.assign(job, { step: 'gap', applied1: Date.now() });
     await log('已申请导出订单报表，5 分钟后申请宝贝明细报表');
@@ -100,6 +107,21 @@ async function stepOrders(tb, job) {
   const pick = (type) => fresh.find((x) => String(x.exportType) === type && x.exportStatus === 'exportSuccess');
   const [orders, items] = [pick('1'), pick('2')];
   if (!orders || !items) return null;
+  return upload(tb, orders, items);
+}
+
+/** 最新的订单报表和宝贝明细报表都生成好、3 小时内申请的、还没导入过 */
+async function reusable(list) {
+  const done = await store.get('uploaded', []);
+  const newest = (type) => list.find((x) => String(x.exportType) === type);
+  const [orders, items] = [newest('1'), newest('2')];
+  const fresh = (x) =>
+    x && x.exportStatus === 'exportSuccess' && !done.includes(String(x.exportId)) &&
+    Date.now() - Date.parse(`${x.applyTime.replace(' ', 'T')}+08:00`) < 3 * 3600 * 1000;
+  return fresh(orders) && fresh(items) ? { orders, items } : null;
+}
+
+async function upload(tb, orders, items) {
   const form = new FormData();
   for (const [x, name] of [[orders, 'orders.xlsx'], [items, 'items.xlsx']]) {
     await sleep(STEP_DELAY);
@@ -108,6 +130,7 @@ async function stepOrders(tb, job) {
   }
   form.append('dry', '0');
   const { report: r } = await server('/api/agent/orders', null, form);
+  await store.set('uploaded', [String(orders.exportId), String(items.exportId), ...(await store.get('uploaded', []))].slice(0, 20));
   return `导入 ${r.orders} 单：新销售 ${r.created_sales.length}，到账 ${r.received}，退款 ${r.refunds.length}，没对上 ${r.unmatched_orders} 单`;
 }
 

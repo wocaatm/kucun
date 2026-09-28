@@ -79,7 +79,10 @@ export class Taobao {
     return list ?? [];
   }
 
-  /** 下载一份报表，返回 base64 */
+  /**
+   * 下载一份报表，返回 base64。
+   * 先由插件后台直接请求（有淘宝域名权限，不受跨域限制，带浏览器里的登录 cookie）；不行再从千牛页面里请求。
+   */
   async download(x) {
     const q = new URLSearchParams({
       f_p: x.orderEncrypterStr,
@@ -90,9 +93,25 @@ export class Taobao {
       export_id: x.exportId,
       isQnNew: 'true',
     });
-    const r = await this.fetch({ url: `https://trade.taobao.com/trade/itemlist/export_by_tfs.do?${q}`, as: 'base64' });
-    if (r.status !== 200 || /text\/html/.test(r.type)) throw new Error('报表下载失败');
-    return r.data;
+    const url = `https://trade.taobao.com/trade/itemlist/export_by_tfs.do?${q}`;
+    const errors = [];
+    try {
+      const r = await fetch(url, { credentials: 'include' });
+      const buf = new Uint8Array(await r.arrayBuffer());
+      if (r.ok && isXlsx(buf)) return toBase64(buf);
+      errors.push(`后台 HTTP ${r.status} ${r.headers.get('content-type') ?? ''} ${preview(buf)}`);
+    } catch (e) {
+      errors.push(`后台 ${e.message ?? e}`);
+    }
+    try {
+      const r = await this.fetch({ url, as: 'base64' });
+      const buf = Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0));
+      if (r.status === 200 && isXlsx(buf)) return r.data;
+      errors.push(`页面 HTTP ${r.status} ${r.type} ${preview(buf)}`);
+    } catch (e) {
+      errors.push(`页面 ${e.message ?? e}`);
+    }
+    throw new Error(`报表下载失败（${errors.join('；')}）`);
   }
 
   // ---------------------------------------------------------------- 商品 SKU
@@ -119,6 +138,15 @@ export class Taobao {
     const d = await this.manage('/taobao/manager/fastEdit.htm?optType=editSku&action=render', { itemId });
     return (d.value?.skuTable?.dataSource ?? []).map((s) => ({ sku_id: String(s.skuId), prop: s.prop, price: s.skuPrice }));
   }
+}
+
+// xlsx 是 zip，开头是 PK
+const isXlsx = (buf) => buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b;
+const preview = (buf) => new TextDecoder().decode(buf.slice(0, 120)).replace(/\s+/g, ' ');
+function toBase64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
 }
 
 // 千牛「批量导出」表单（2026-09 抓的；近 3 个月、全部订单状态）
