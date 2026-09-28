@@ -1,0 +1,10 @@
+node_modules
+dist
+.env
+data/
+server/data/
+*.log
+.DS_Store
+.shots/
+*.tsbuildinfo
+data.bak-*/

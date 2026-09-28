@@ -1,0 +1,27 @@
+{
+  "name": "kucun-server",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env --disable-warning=ExperimentalWarning src/main.ts",
+    "start": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning src/main.ts",
+    "test": "node --test --disable-warning=ExperimentalWarning test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "pull:online": "bash scripts/pull-online.sh",
+    "import:taobao": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning scripts/import-taobao.ts",
+    "sync:aldi": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning scripts/sync-aldi.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/multipart": "^10.1.2",
+    "@fastify/static": "^10.1.5",
+    "fastify": "^5.12.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2"
+  }
+}
