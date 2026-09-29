@@ -339,7 +339,8 @@ export function buildApp(opts: AppOptions) {
 
   // ---------- 单据 ----------
   app.get('/api/docs', async (req) => {
-    const { type = '', status = '', q = '', review = '', offset = '0', limit = '30' } = req.query as Record<string, string>;
+    const { type = '', status = '', q = '', review = '', sort = 'desc', offset = '0', limit = '30' } = req.query as Record<string, string>;
+    const dir = sort === 'asc' ? 'ASC' : 'DESC';
     const where: string[] = [];
     const params: (string | number)[] = [];
     if (q.trim()) {
@@ -369,7 +370,7 @@ export function buildApp(opts: AppOptions) {
          FROM docs d JOIN users u ON u.id = d.created_by
          LEFT JOIN accounts a ON a.id = d.account_id LEFT JOIN accounts t ON t.id = d.to_account_id
          ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-         ORDER BY d.id DESC LIMIT ? OFFSET ?`,
+         ORDER BY d.doc_date ${dir}, d.id ${dir} LIMIT ? OFFSET ?`,
       )
       .all(...params, Number(limit), Number(offset));
     return { items: rows };

@@ -995,6 +995,19 @@ body {
 }
 .doc-search {
   padding: 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.doc-search .adm-search-bar {
+  flex: 1;
+}
+.doc-sort {
+  flex: none;
+  font-size: 13px;
+  color: var(--adm-color-primary);
+  white-space: nowrap;
+  padding-right: 8px;
 }
 .btn-row {
   display: flex;

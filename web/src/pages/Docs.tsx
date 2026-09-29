@@ -36,6 +36,7 @@ function DocList() {
   const nav = useNavigate();
   const [type, setType] = useState('');
   const [q, setQ] = useState('');
+  const [sort, setSort] = useState<'desc' | 'asc'>('desc');
   const [items, setItems] = useState<Doc[]>([]);
   const [hasMore, setHasMore] = useState(true);
   const gen = useRef(0);
@@ -44,12 +45,12 @@ function DocList() {
     gen.current++;
     setItems([]);
     setHasMore(true);
-  }, [type, q]);
+  }, [type, q, sort]);
 
   const loadMore = async () => {
     const g = gen.current;
     const r = await get<{ items: Doc[] }>(
-      `/api/docs?type=${type}&q=${encodeURIComponent(q)}&offset=${items.length}&limit=30`,
+      `/api/docs?type=${type}&q=${encodeURIComponent(q)}&sort=${sort}&offset=${items.length}&limit=30`,
     );
     if (g !== gen.current) return;
     setItems((x) => [...x, ...r.items]);
@@ -65,6 +66,9 @@ function DocList() {
       </CapsuleTabs>
       <div className="doc-search">
         <SearchBar placeholder="搜淘宝订单号 / 备注" onSearch={setQ} onClear={() => setQ('')} />
+        <span className="doc-sort" onClick={() => setSort((s) => (s === 'desc' ? 'asc' : 'desc'))}>
+          {sort === 'desc' ? '日期 新→旧' : '日期 旧→新'}
+        </span>
       </div>
       <List>
         {items.map((d) => {
