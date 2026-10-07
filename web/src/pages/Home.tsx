@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Button, Dialog, PullToRefresh, Skeleton, Toast } from 'antd-mobile';
+import { Button, CalendarPicker, Dialog, PullToRefresh, Skeleton, Toast } from 'antd-mobile';
 import { LeftOutline, RightOutline } from 'antd-mobile-icons';
 import dayjs from 'dayjs';
 import { get, money, post, type Account } from '../api';
@@ -33,7 +33,8 @@ interface Settle {
 }
 
 interface Dashboard {
-  month: string;
+  from: string;
+  to: string;
   accounts: Account[];
   settle: Settle[];
   capital: number;
@@ -170,12 +171,17 @@ function TaobaoCard({ data }: { data: Dashboard }) {
 export default function Home() {
   const nav = useNavigate();
   const { user, refreshMeta } = useSession();
-  const [month, setMonth] = useState(dayjs().format('YYYY-MM'));
+  // 经营统计的日期区间（闭区间），默认本月 1 号到今天
+  const [range, setRange] = useState(() => ({
+    from: dayjs().startOf('month').format('YYYY-MM-DD'),
+    to: dayjs().format('YYYY-MM-DD'),
+  }));
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [data, setData] = useState<Dashboard | null>(null);
 
   const load = useCallback(async () => {
-    setData(await get<Dashboard>(`/api/dashboard?month=${month}`));
-  }, [month]);
+    setData(await get<Dashboard>(`/api/dashboard?from=${range.from}&to=${range.to}`));
+  }, [range]);
 
   useEffect(() => {
     load().catch((e) => Toast.show(e.message));
@@ -221,7 +227,23 @@ export default function Home() {
   const tp = data.total_profit;
   const pub = data.accounts.find((a) => a.kind === 'public')!;
   const persons = data.accounts.filter((a) => a.kind === 'person');
-  const isCurrent = month === dayjs().format('YYYY-MM');
+  const today = dayjs().format('YYYY-MM-DD');
+  const from = dayjs(range.from);
+  const to = dayjs(range.to);
+  // 区间正好是某个整月（当月则到今天为止）时，按「X月」显示，左右箭头按整月翻
+  const monthEnd = from.endOf('month').format('YYYY-MM-DD');
+  const isWholeMonth = range.from === from.startOf('month').format('YYYY-MM-DD') && (range.to === monthEnd || (range.to === today && monthEnd > today));
+  const isCurrent = from.isSame(dayjs(), 'month') || range.to >= today;
+  const isThisMonth = isWholeMonth && from.isSame(dayjs(), 'month');
+  const rangeTitle = isWholeMonth
+    ? from.format(from.isSame(dayjs(), 'year') ? 'M月' : 'YYYY年M月')
+    : from.isSame(to, 'day')
+      ? from.format('M月D日')
+      : `${from.format(from.isSame(to, 'year') ? 'M/D' : 'YYYY/M/D')}–${to.format(from.isSame(to, 'year') ? 'M/D' : 'YYYY/M/D')}`;
+  const setMonth = (m: dayjs.Dayjs) => {
+    const end = m.endOf('month').format('YYYY-MM-DD');
+    setRange({ from: m.startOf('month').format('YYYY-MM-DD'), to: end > today ? today : end });
+  };
 
   return (
     <PullToRefresh onRefresh={load}>
@@ -230,15 +252,28 @@ export default function Home() {
           <div className="hero-top">
             <span>你好，{user?.name}</span>
             <div className="month-switch">
-              <LeftOutline onClick={() => setMonth(dayjs(month).subtract(1, 'month').format('YYYY-MM'))} />
-              <span>{dayjs(month).format('YYYY年M月')}</span>
+              <LeftOutline onClick={() => setMonth(from.subtract(1, 'month'))} />
+              <span onClick={() => setPickerOpen(true)}>{rangeTitle}</span>
               <RightOutline
                 className={isCurrent ? 'disabled' : ''}
-                onClick={() => !isCurrent && setMonth(dayjs(month).add(1, 'month').format('YYYY-MM'))}
+                onClick={() => !isCurrent && setMonth(from.add(1, 'month'))}
               />
             </div>
+            <CalendarPicker
+              key={`${range.from}_${range.to}`}
+              visible={pickerOpen}
+              selectionMode="range"
+              title="选择统计区间"
+              defaultValue={[from.toDate(), to.toDate()]}
+              min={dayjs().subtract(1, 'year').startOf('month').toDate()}
+              max={dayjs().toDate()}
+              onClose={() => setPickerOpen(false)}
+              onConfirm={(v) => {
+                if (v) setRange({ from: dayjs(v[0]).format('YYYY-MM-DD'), to: dayjs(v[1]).format('YYYY-MM-DD') });
+              }}
+            />
           </div>
-          <div className="hero-label">本月净利润</div>
+          <div className="hero-label">{isThisMonth ? '本月' : rangeTitle}净利润</div>
           <div className="hero-value">{money(mp.net)}</div>
           <div className="hero-row">
             <div>
@@ -360,7 +395,7 @@ export default function Home() {
         </div>
 
         <div className="card">
-          <div className="card-title">{dayjs(month).format('M月')}经营</div>
+          <div className="card-title">{rangeTitle}经营</div>
           <ProfitRows p={mp} />
         </div>
 

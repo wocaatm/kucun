@@ -638,14 +638,28 @@ export function buildApp(opts: AppOptions) {
 
   // ---------- 首页 ----------
   app.get('/api/dashboard', async (req) => {
+    const q = req.query as Record<string, string | undefined>;
+    const isDate = (v?: string) => !!v && /^\d{4}-\d{2}-\d{2}$/.test(v);
     const d = new Date();
-    const month = (req.query as any).month || `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    // 默认本月 1 号到今天；兼容旧的 ?month=2026-09（整月）
+    let from = `${today.slice(0, 8)}01`;
+    let to = today;
+    if (q.month && /^\d{4}-\d{2}$/.test(q.month)) {
+      from = `${q.month}-01`;
+      to = `${q.month}-31`;
+    }
+    if (isDate(q.from)) from = q.from!;
+    if (isDate(q.to)) to = q.to!;
+    if (from > to) [from, to] = [to, from];
     return {
-      month,
+      from,
+      to,
       accounts: accountBalances(db),
       settle: settleSuggestions(db),
       capital: capital(db),
-      month_profit: profit(db, month),
+      month_profit: profit(db, { from, to }),
       total_profit: profit(db),
       inventory: inventorySummary(db),
       receivable: (({ items: _items, ...r }) => r)(receivable(db)),

@@ -50,10 +50,10 @@ function sum(db: DB, sql: string, params: (string | number)[]): number {
   return r.v ?? 0;
 }
 
-/** 利润表；month 形如 2026-09，不传为累计 */
-export function profit(db: DB, month?: string) {
-  const dateCond = month ? `AND d.doc_date LIKE ?` : '';
-  const p = month ? [`${month}%`] : [];
+/** 利润表；range 为闭区间 YYYY-MM-DD，不传为累计 */
+export function profit(db: DB, range?: { from: string; to: string }) {
+  const dateCond = range ? `AND d.doc_date BETWEEN ? AND ?` : '';
+  const p = range ? [range.from, range.to] : [];
 
   const sales = sum(
     db,
