@@ -29,6 +29,8 @@ export interface ItemInput {
   /** 入库类：这一行的总价（分，含运费等分摊）。给了就按总价记成本，unit_price 由它算出均价 */
   amount?: number;
   counted_qty?: number;
+  /** 进货：其中真正入库的件数（0 ~ qty，默认 = qty）。没入库的不进库存，钱照样算在付款账户上；qty 是买入数，均价按它算 */
+  in_qty?: number;
   raw_name?: string;
   /** 仅导入用：淘宝子订单号 */
   source_ref?: string;
@@ -114,6 +116,7 @@ export function createDoc(db: DB, userId: number, input: DocInput, sys: DocSys =
       if (!items.length && !(type === 'sale' && sys.allow_empty)) fail('至少添加一个商品');
       for (const it of items) {
         if (!isInt(it.qty) || it.qty <= 0) fail('数量需为正整数');
+        if (it.in_qty != null && (type !== 'purchase' || !isInt(it.in_qty) || it.in_qty < 0 || it.in_qty > it.qty!)) fail('入库数需在 0 到买入数之间');
         if ((IN_TYPES.has(type) || type === 'sale') && it.amount != null) {
           if (!isInt(it.amount) || it.amount < 0) fail('总价不能为空');
           it.unit_price = Math.round(it.amount / it.qty!);
@@ -205,17 +208,20 @@ export function createDoc(db: DB, userId: number, input: DocInput, sys: DocSys =
         const p = db.prepare('SELECT stock_qty FROM products WHERE id = ?').get(it.product_id) as { stock_qty: number };
         ins.run(docId, it.product_id, it.counted_qty! - p.stock_qty, 0, 0, it.counted_qty!, '', null, null);
       } else {
-        ins.run(
+        // 进货入库数比买入数少：库存只进入库的件数和对应的成本，其余只记花的钱
+        const inQty = it.in_qty ?? it.qty!;
+        const r = ins.run(
           docId,
           it.product_id,
-          it.qty!,
+          inQty,
           it.unit_price ?? 0,
           it.amount ?? 0,
           null,
           it.raw_name ?? '',
           sys.source ? (it.source_ref ?? null) : null,
-          type === 'purchase' ? landed[idx] : null,
+          type === 'purchase' ? Math.round((landed[idx] * inQty) / it.qty!) : null,
         );
+        if (inQty !== it.qty) db.prepare('UPDATE doc_items SET buy_qty = ? WHERE id = ?').run(it.qty!, r.lastInsertRowid);
       }
       touched.add(it.product_id);
       // 记住「小票上的名字 → 商品」，下次识别自动匹配

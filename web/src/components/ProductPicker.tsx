@@ -75,7 +75,7 @@ export default function ProductPicker({ visible, onClose, onPick, initialQuery =
   useEffect(() => {
     if (!visible) return;
     const t = setTimeout(() => {
-      get<{ items: Product[] }>(`/api/products?q=${encodeURIComponent(q)}&limit=30`).then((r) => setList(r.items));
+      get<{ items: Product[] }>(`/api/products?q=${encodeURIComponent(q)}&limit=200`).then((r) => setList(r.items));
       if (q.trim()) get<{ items: CatalogItem[] }>(`/api/catalog?q=${encodeURIComponent(q)}`).then((r) => setCatalog(r.items));
       else setCatalog([]);
     }, 250);

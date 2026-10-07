@@ -13,6 +13,8 @@ export interface Line {
   qty: number;
   price: string; // 元；进货时是这一行的总价（含运费等），其余是单价
   counted?: number;
+  /** 进货：其中真正入库的件数，不填 = 和买入数一样；没入库的只记花的钱 */
+  inQty?: number;
   raw_name?: string;
   barcode?: string | null;
   candidates?: Product[];
@@ -55,6 +57,7 @@ export function linesToItems(lines: Line[], mode: EditorMode): { items?: any[]; 
     items: lines.map((l) => ({
       ...ref(l),
       qty: l.qty,
+      ...(mode === 'purchase' && l.inQty != null && l.inQty !== l.qty ? { in_qty: l.inQty } : {}),
       ...(isTotalMode(mode) ? { amount: toFen(l.price) } : { unit_price: mode === 'outbound' ? 0 : toFen(l.price) }),
       raw_name: l.raw_name,
     })),
@@ -166,7 +169,12 @@ export default function ItemsEditor({ mode, lines, onChange, autoScan }: Props) 
             </div>
           ) : (
             <div className="line-row">
-              <Stepper min={1} value={l.qty} onChange={(v) => update(l.key, { qty: v || 1 })} />
+              <Stepper
+                min={1}
+                value={l.qty}
+                // 入库数没改过就跟着买入数走，改小过的不超过新的买入数
+                onChange={(v) => update(l.key, { qty: v || 1, inQty: l.inQty == null || l.inQty >= l.qty ? undefined : Math.min(l.inQty, v || 1) })}
+              />
               {mode !== 'outbound' && (
                 <>
                   <div className="price-input">
@@ -186,6 +194,13 @@ export default function ItemsEditor({ mode, lines, onChange, autoScan }: Props) 
               {mode === 'sale' && l.product?.avg_cost != null && (
                 <span className="line-hint">均价 {money(l.product.avg_cost)}</span>
               )}
+            </div>
+          )}
+          {mode === 'purchase' && (
+            <div className="line-row line-in">
+              <span className="muted">其中入库</span>
+              <Stepper min={0} max={l.qty} value={l.inQty ?? l.qty} onChange={(v) => update(l.key, { inQty: v === l.qty ? undefined : v })} />
+              {(l.inQty ?? l.qty) < l.qty && <span className="warn-text small">{l.qty - (l.inQty ?? l.qty)} 件不进库存，只记花的钱</span>}
             </div>
           )}
         </div>

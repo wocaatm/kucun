@@ -142,6 +142,8 @@ export interface DocItem {
   unit_cost?: number;
   /** 退货明细：退回入库成本、对应的销售明细 */
   in_cost?: number | null;
+  /** 进货买入数：入库数（qty）比它少时才有 */
+  buy_qty?: number | null;
   ref_item_id?: number | null;
 }
 

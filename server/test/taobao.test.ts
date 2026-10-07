@@ -8,7 +8,7 @@ import { buildApp } from '../src/app.ts';
 import { readXlsx } from '../src/xlsx.ts';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'kucun-tb-'));
-const { app } = buildApp({ dataDir });
+const { app, db } = buildApp({ dataDir });
 let cookie = '';
 
 async function api(method: string, url: string, body?: unknown) {
@@ -122,7 +122,20 @@ const itemRows = (orders: Order[]) =>
     })),
   );
 
-async function importOrders(orders: Order[], dry = false, auth?: { url: string; headers: Record<string, string> }) {
+/**
+ * 导入；默认导完把「同步待确认」全部直接确认掉（模拟人逐单确认过），老用例只关心导入本身。
+ * 报告里的待办计数换成确认后的。keepReview = true 时保留待确认。
+ */
+async function importOrders(orders: Order[], dry = false, auth?: { url: string; headers: Record<string, string> }, keepReview = false) {
+  const report = await importRaw(orders, dry, auth);
+  if (dry || keepReview) return report;
+  db.exec("UPDATE taobao_reviews SET confirmed_at = datetime('now') WHERE confirmed_at IS NULL");
+  const c = await api('POST', '/api/taobao/reviews/confirm-all');
+  const st = (await api('GET', '/api/dashboard')).taobao;
+  return { ...report, rebuilt_sales: [...report.rebuilt_sales, ...c.rebuilt_sales], unmatched_orders: st.unmatched_orders, unmatched_amount: st.unmatched_amount, reviews: st.reviews };
+}
+
+async function importRaw(orders: Order[], dry = false, auth?: { url: string; headers: Record<string, string> }, onlyData = false) {
   const boundary = '----kucuntest';
   const part = (name: string, filename: string, buf: Buffer) =>
     Buffer.concat([
@@ -134,6 +147,7 @@ async function importOrders(orders: Order[], dry = false, auth?: { url: string; 
     // 故意把子订单表放前面：按表头识别，和顺序无关
     part('b', 'items.xlsx', xlsx(itemRows(orders))),
     part('a', 'orders.xlsx', xlsx(orderRows(orders))),
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="only_data"\r\n\r\n${onlyData ? '1' : '0'}\r\n`),
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="dry"\r\n\r\n${dry ? '1' : '0'}\r\n--${boundary}--\r\n`),
   ]);
   const res = await app.inject({
@@ -484,6 +498,126 @@ test('改单据日期和支出分类：不动金额；淘宝单据不能改日�
   await assert.rejects(api('PATCH', `/api/docs/${doc.id}`, { category: '不存在' }), /分类/);
   const tb = (await api('GET', '/api/docs?q=T1')).items.find((x: any) => x.status === 'active' && x.type === 'sale');
   await assert.rejects(api('PATCH', `/api/docs/${tb.id}`, { doc_date: '2026-01-01' }), /不能改/);
+});
+
+test('同步待确认：新订单 / 状态变了的要逐单确认扣了哪些库存；没确认完不让再同步', async () => {
+  db.exec("UPDATE taobao_reviews SET confirmed_at = datetime('now')"); // 前面用例留下的不管
+  const R1: Order = { no: 'R1', status: '买家已付款,等待卖家发货', paid: '20.00', subs: [{ sub: 'R1-1', item: '100', sku: 'LACURA隔离霜40g', qty: 1, paid: '20.00' }] };
+  const R2: Order = {
+    no: 'R2',
+    status: '卖家已发货，等待买家确认',
+    paid: '30.00',
+    shipped: '2026-09-26 09:00:00',
+    subs: [{ sub: 'R2-1', item: '900', sku: '没对照的东西', qty: 1, paid: '30.00' }],
+  };
+  const R3: Order = { no: 'R3', status: '交易关闭', paid: '0.00', subs: [{ sub: 'R3-1', item: '100', sku: 'LACURA隔离霜40g', qty: 1, paid: '' }] };
+  const r = await importOrders([R1, R2, R3], false, undefined, true);
+  assert.equal(r.reviews, 1); // 只有发了货（要扣库存）的 R2；没发货的 R1、没发货就关闭的 R3 不用确认
+  let list = (await api('GET', '/api/taobao/reviews')).items;
+  assert.deepEqual(list.map((x: any) => x.order.order_no), ['R2']);
+  assert.deepEqual(list[0].changes, ['新订单：卖家已发货，等待买家确认']);
+  assert.match(list[0].issue, /没对上/);
+  assert.equal((await api('GET', '/api/dashboard')).taobao.reviews, 1);
+
+  // 没确认完：页面点同步、插件自动同步都不让
+  await assert.rejects(api('POST', '/api/plugin/tasks', { kind: 'sync_orders' }), /1 笔订单没确认/);
+  const { token } = await api('POST', '/api/plugin/token');
+  const own = await app.inject({ method: 'POST', url: '/api/agent/tasks', payload: { kind: 'sync_orders' }, headers: { authorization: `Bearer ${token}` } });
+  assert.equal(own.statusCode, 400);
+  assert.match((await api('GET', '/api/plugin')).tasks[0].message, /自动同步跳过/);
+  await api('POST', '/api/plugin/tasks', { kind: 'sync_skus' }); // 拉 SKU 不受影响
+
+  // 有问题的单不能直接确认，一键确认也跳过它
+  await assert.rejects(api('POST', '/api/taobao/reviews/R2/confirm'), /没对上/);
+  assert.equal((await api('POST', '/api/taobao/reviews/confirm-all')).confirmed, 0);
+  // 改实发（这单其实发了一支护手霜）：确认前不扣库存，确认后才扣
+  const b0 = await stock(B);
+  await api('PUT', '/api/taobao/orders/R2/actual', { items: [{ product_id: B, qty: 1 }] });
+  assert.equal(await stock(B), b0);
+  const d0 = await api('GET', '/api/dashboard');
+  assert.equal(d0.taobao.unmatched_orders, 0); // 待确认的不算进「没对上」
+  assert.equal((await api('POST', '/api/taobao/reviews/R2/confirm')).left, 0);
+  assert.equal(await stock(B), b0 - 1);
+  // 确认后才计入销售额
+  assert.equal((await api('GET', '/api/dashboard')).total_profit.revenue - d0.total_profit.revenue, 3000);
+
+  // 再导一遍没变化：不新增；R1 发货了：重新打开
+  assert.equal((await importOrders([R1, R2, R3], false, undefined, true)).reviews, 0);
+  const a0 = await stock(A);
+  await importOrders([{ ...R1, status: '卖家已发货，等待买家确认', shipped: '2026-09-27 09:00:00' }], false, undefined, true);
+  list = (await api('GET', '/api/taobao/reviews')).items;
+  assert.equal(list.length, 1);
+  assert.deepEqual(list[0].changes, ['买家已付款,等待卖家发货 → 卖家已发货，等待买家确认']);
+  assert.equal(await stock(A), a0); // 发货了，但没确认前不扣
+  const all = await api('POST', '/api/taobao/reviews/confirm-all');
+  assert.equal(all.confirmed, 1);
+  assert.equal(all.left, 0);
+  assert.equal(await stock(A), a0 - 1);
+  // 发货后退款：进待确认，要先说货有没有退回来
+  const R1r: Order = { ...R1, status: '卖家已发货，等待买家确认', shipped: '2026-09-27 09:00:00', subs: [{ ...R1.subs[0], refund: '20.00' }] };
+  await importOrders([R1r], false, undefined, true);
+  list = (await api('GET', '/api/taobao/reviews')).items;
+  assert.deepEqual(list[0].changes, ['退款成功：LACURA隔离霜40g']);
+  assert.match(list[0].issue, /退回/);
+  const refundDoc = list[0].docs.find((d: any) => d.type === 'sale_return' && d.review === 'pending');
+  assert.ok(refundDoc.ref_doc_id);
+  await assert.rejects(api('POST', '/api/taobao/reviews/R1/confirm'), /退回/);
+  await api('POST', `/api/docs/${refundDoc.id}/refund-only`);
+  assert.equal((await api('POST', '/api/taobao/reviews/R1/confirm')).left, 0);
+  assert.equal(await stock(A), a0 - 1); // 只退了钱，货没回来
+  // 交易成功只是到账，不影响库存，不用再确认
+  await importOrders([{ ...R1r, status: '交易成功', confirmed: '2026-09-30 09:00:00' }], false, undefined, true);
+  assert.equal((await api('GET', '/api/taobao/reviews')).items.length, 0);
+  // 确认完可以同步了
+  assert.ok((await api('POST', '/api/plugin/tasks', { kind: 'sync_orders' })).id);
+  db.exec('DELETE FROM agent_tasks');
+});
+
+test('只同步订单数据：已发货的照算销售额进公共资金，不扣库存、不生成待确认；以后也不补扣，没发货的以后照常', async () => {
+  const D1: Order = {
+    no: 'D1',
+    status: '交易成功',
+    paid: '25.00',
+    postage: '5.00',
+    shipped: '2026-09-28 09:00:00',
+    confirmed: '2026-10-01 09:00:00',
+    subs: [{ sub: 'D1-1', item: '100', sku: 'LACURA隔离霜40g', qty: 1, paid: '20.00' }],
+  };
+  const D2: Order = { no: 'D2', status: '买家已付款,等待卖家发货', paid: '20.00', subs: [{ sub: 'D2-1', item: '100', sku: 'LACURA隔离霜40g', qty: 1, paid: '20.00' }] };
+  const D3: Order = {
+    no: 'D3',
+    status: '卖家已发货，等待买家确认',
+    paid: '30.00',
+    shipped: '2026-09-29 09:00:00',
+    subs: [{ sub: 'D3-1', item: '100', sku: 'LACURA隔离霜40g', qty: 1, paid: '30.00', refund: '10.00' }],
+  };
+  const a0 = await stock(A);
+  const d0 = await api('GET', '/api/dashboard');
+  const pub0 = await pubBalance();
+  const reviews0 = (await api('GET', '/api/taobao/reviews')).items.length;
+  const r = await importRaw([D1, D2, D3], false, undefined, true);
+  assert.equal(r.baseline, 2);
+  assert.equal(r.created_sales.length, 2);
+  assert.equal(r.refunds.length, 1);
+  assert.equal(await stock(A), a0); // 不扣库存
+  assert.equal((await api('GET', '/api/taobao/reviews')).items.length, reviews0); // 不进待确认
+  const d1 = await api('GET', '/api/dashboard');
+  assert.equal(d1.total_profit.revenue - d0.total_profit.revenue, 2500 + 3000 - 1000); // 销售额照算（含邮费、扣退款）
+  assert.equal(d1.receivable.amount - d0.receivable.amount, 3000 - 1000); // D3 没确认收货：应收
+  assert.equal((await pubBalance()) - pub0, 2500); // 到账的才进公共资金余额，D3 先记应收
+  assert.equal(d1.taobao.pending_refunds, d0.taobao.pending_refunds); // 已退的直接算处理过
+  const o1 = await api('GET', '/api/taobao/orders/D1');
+  assert.equal(o1.docs.length, 1);
+  assert.equal(o1.docs[0].received, 1);
+  // 之后正常同步：D3 交易成功只到账、不扣库存不进待确认；D2 发货了照常进待确认
+  await importRaw([D1, { ...D3, status: '交易成功', confirmed: '2026-10-03 09:00:00' }, { ...D2, status: '卖家已发货，等待买家确认', shipped: '2026-10-02 09:00:00' }]);
+  const list = (await api('GET', '/api/taobao/reviews')).items.map((x: any) => x.order.order_no);
+  assert.deepEqual(list.filter((n: string) => n.startsWith('D')), ['D2']);
+  assert.equal((await api('GET', '/api/taobao/orders/D3')).docs.filter((d: any) => d.type === 'sale')[0].received, 1);
+  assert.equal(await stock(A), a0);
+  db.exec("UPDATE taobao_reviews SET confirmed_at = datetime('now') WHERE confirmed_at IS NULL");
+  await api('POST', '/api/taobao/reviews/confirm-all');
+  assert.equal(await stock(A), a0 - 1); // 只有 D2
 });
 
 test('淘宝插件：连接码鉴权、领任务、上传商品 SKU 清单（自动猜对照待确认）和订单表', async () => {

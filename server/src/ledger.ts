@@ -1,6 +1,6 @@
 import type { DB } from './db.ts';
 import { LOW_STOCK_THRESHOLD, PROFIT_SHARES } from './settings.ts';
-import { UNMATCHED_PREFIX, UNCHECKED_PREFIX } from './taobao.ts';
+import { UNMATCHED_PREFIX, UNCHECKED_PREFIX, REVIEW_PREFIX } from './taobao.ts';
 
 /**
  * 账户余额 = 生意在这个账户里的钱。
@@ -61,12 +61,12 @@ export function profit(db: DB, month?: string) {
      WHERE status = 'active' AND type IN ('sale', 'sale_return') ${dateCond}`,
     p,
   );
-  // 淘宝订单里没对上商品的行（未匹配 SKU / 待核对实发）连同这单的邮费：先不计入销售额和成本，确认后随重建计入
+  // 淘宝订单里没对上商品的行（未匹配 SKU / 待核对实发 / 同步后待确认）连同这单的邮费：先不计入销售额和成本，确认后随重建计入
   const pendingLines = sum(
     db,
     `SELECT SUM(j.amount) v FROM doc_adjustments j JOIN docs d ON d.id = j.doc_id
      WHERE d.status = 'active' AND d.type = 'sale' AND d.review = 'unmatched'
-       AND (j.name LIKE '${UNMATCHED_PREFIX}%' OR j.name LIKE '${UNCHECKED_PREFIX}%' OR j.name = '邮费') ${dateCond}`,
+       AND (j.name LIKE '${UNMATCHED_PREFIX}%' OR j.name LIKE '${UNCHECKED_PREFIX}%' OR j.name LIKE '${REVIEW_PREFIX}%' OR j.name = '邮费') ${dateCond}`,
     p,
   );
   // 这些行上发生的退款（不关联商品的「退款：…」）同样先不计

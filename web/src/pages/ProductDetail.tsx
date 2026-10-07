@@ -137,13 +137,13 @@ export default function ProductDetail() {
         </div>
       </div>
       <div className="editor-buttons" style={{ padding: '0 12px' }}>
-        <Button color="primary" fill="outline" onClick={() => nav('/new/purchase')}>
+        <Button color="primary" fill="outline" onClick={() => nav(`/new/purchase?product=${id}`)}>
           进货
         </Button>
-        <Button color="primary" fill="outline" onClick={() => nav('/new/sale')}>
+        <Button color="primary" fill="outline" onClick={() => nav(`/new/sale?product=${id}`)}>
           卖出
         </Button>
-        <Button fill="outline" onClick={() => nav('/new/stocktake')}>
+        <Button fill="outline" onClick={() => nav(`/new/stocktake?product=${id}`)}>
           盘点
         </Button>
       </div>

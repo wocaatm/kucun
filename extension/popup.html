@@ -17,10 +17,13 @@
 </head>
 <body>
   <h1>小库存 · 淘宝助手</h1>
-  <div class="muted">用这个浏览器里的千牛登录态导出订单、拉取商品 SKU。浏览器开着、千牛登录着就行。</div>
+  <div class="muted">用这个浏览器里的千牛登录态导出订单、拉取商品 SKU。浏览器开着就行，登录过期会自动登录。</div>
   <label>小库存地址 <input id="server" /></label>
   <label>连接码（小库存「我的 → 淘宝插件」里复制） <input id="token" /></label>
   <label>每天自动同步订单的时间 <input id="dailyAt" type="time" /></label>
+  <label>千牛账号（登录过期时自动登录用，可不填） <input id="tbUser" autocomplete="off" /></label>
+  <label>千牛密码 <input id="tbPass" type="password" autocomplete="off" /></label>
+  <div class="muted">只存在这台电脑的浏览器里。淘宝要滑块 / 短信验证时会弹通知，请手动完成，插件登上后自动继续。</div>
   <div class="row"><button id="save" class="primary">保存</button></div>
   <div class="row">
     <button id="orders">立即同步订单</button>

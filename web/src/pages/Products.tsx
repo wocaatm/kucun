@@ -16,7 +16,7 @@ export default function Products() {
 
   useEffect(() => {
     const t = setTimeout(() => {
-      get<{ items: Product[] }>(`/api/products?q=${encodeURIComponent(q)}&filter=${filter}`).then((r) => setItems(r.items));
+      get<{ items: Product[] }>(`/api/products?q=${encodeURIComponent(q)}&filter=${filter}&limit=200`).then((r) => setItems(r.items));
     }, 200);
     return () => clearTimeout(t);
   }, [q, filter]);

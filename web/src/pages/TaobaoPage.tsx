@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Badge, Button, CapsuleTabs, Dialog, Empty, List, NavBar, Popup, SearchBar, Tabs, Tag, Toast } from 'antd-mobile';
+import { Badge, Button, CapsuleTabs, Checkbox, Dialog, Empty, List, NavBar, Popup, SearchBar, Tabs, Tag, Toast } from 'antd-mobile';
 import { api, get, money, post, type TaobaoOrder } from '../api';
 import { useSession } from '../store';
 import ProductsEditor, { pickedToInput, type PickedProduct, type Suggestion } from '../components/ProductsEditor';
@@ -45,6 +45,7 @@ interface Overview {
     to_ship: number;
     unconfirmed_sku: number;
     pending_refunds: number;
+    reviews: number;
     last_import: string | null;
   };
   receivable: {
@@ -70,6 +71,8 @@ interface Report {
   unmatched_orders: number;
   unmatched_amount: number;
   to_ship: number;
+  reviews: number;
+  baseline?: number;
   errors: string[];
   negative: { id: number; name: string; stock_qty: number }[];
 }
@@ -82,26 +85,43 @@ const SKU_STATE: Record<Sku['state'], { text: string; color: string }> = {
 
 const productsText = (ps: PickedProduct[]) => ps.map((p) => `${p.name}${p.qty > 1 ? ` ×${p.qty}` : ''}`).join(' + ');
 
-function ImportTab({ onDone }: { onDone: () => void }) {
+function ImportTab({ reviews, onDone }: { reviews: number; onDone: () => void }) {
   const nav = useNavigate();
   const { refreshMeta } = useSession();
   const input = useRef<HTMLInputElement>(null);
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
+  /** 只同步订单数据（初始化用）：不扣库存、不生成待办 */
+  const [onlyData, setOnlyData] = useState(false);
   const [result, setResult] = useState<{ dry: boolean; report: Report } | null>(null);
 
   const run = async (dry: boolean) => {
     if (files.length < 2) return void Toast.show('请选上主订单表和子订单表两个文件');
+    if (!dry && onlyData) {
+      const ok = await Dialog.confirm({
+        content: '只同步订单数据：已发货的订单照算销售额，但不扣库存、不生成待确认；这些订单以后也不会再扣库存（当作已经盘点对齐）。确定？',
+      });
+      if (!ok) return;
+    }
+    if (!dry && !onlyData && reviews) {
+      Toast.show(`上次同步还有 ${reviews} 单没确认，先确认完再导入`);
+      return nav('/taobao/review');
+    }
     setBusy(true);
     try {
       const fd = new FormData();
       files.forEach((f, i) => fd.append(`file${i}`, f, f.name));
       fd.append('dry', dry ? '1' : '0');
+      fd.append('only_data', onlyData ? '1' : '0');
       const r = await api<{ dry: boolean; report: Report }>('POST', '/api/taobao/import', fd);
       setResult(r);
       if (!dry) {
         refreshMeta();
         onDone();
+        if (!onlyData && r.report.reviews) {
+          Toast.show(`有 ${r.report.reviews} 单新发货要扣库存，逐单确认一下`);
+          nav('/taobao/review');
+        }
       }
     } catch (e: any) {
       Toast.show({ content: e.message, icon: 'fail' });
@@ -131,6 +151,16 @@ function ImportTab({ onDone }: { onDone: () => void }) {
         <Button block onClick={() => input.current?.click()} style={{ marginTop: 12 }}>
           {files.length ? files.map((f) => f.name).join('、') : '选择两个 Excel 文件'}
         </Button>
+        <div style={{ marginTop: 12 }}>
+          <Checkbox checked={onlyData} onChange={setOnlyData}>
+            只同步订单数据（算销售额，不扣库存、不生成待办）
+          </Checkbox>
+          {onlyData && (
+            <div className="warn-text small" style={{ marginTop: 4 }}>
+              初始化用：已发货的照样生成销售单、算销售额（到账的进公共资金，没确认收货的记应收），已退款的扣掉，但不扣库存，以后也不会补扣；还没发货的以后发货照常进待确认。
+            </div>
+          )}
+        </div>
         <div className="btn-row" style={{ marginTop: 12 }}>
           <Button fill="outline" loading={busy} onClick={() => run(true)}>
             先试跑看看
@@ -150,6 +180,12 @@ function ImportTab({ onDone }: { onDone: () => void }) {
                 {r.orders} / {r.sub_orders}
               </b>
             </div>
+            {r.baseline != null && (
+              <div>
+                <span>只同步数据：已发货、不扣库存的子订单</span>
+                <b>{r.baseline}</b>
+              </div>
+            )}
             <div>
               <span>新生成销售单（已发货）</span>
               <b>{r.created_sales.length}</b>
@@ -262,7 +298,7 @@ export default function TaobaoPage() {
   };
 
   const st = data?.status;
-  const todoCount = st ? st.unmatched_orders + st.pending_refunds : 0;
+  const todoCount = st ? st.unmatched_orders + st.pending_refunds + st.reviews : 0;
 
   return (
     <div className="page">
@@ -275,12 +311,17 @@ export default function TaobaoPage() {
         <Tabs.Tab title="应收" key="due" />
       </Tabs>
 
-      {tab === 'import' && <ImportTab onDone={load} />}
+      {tab === 'import' && <ImportTab reviews={st?.reviews ?? 0} onDone={load} />}
       {tab === 'orders' && <OrdersTab group={params.get('group') ?? 'shipped'} onGroup={(g) => setParams({ tab: 'orders', group: g }, { replace: true })} />}
 
       {data && tab === 'todo' && (
         <>
           <div className="muted small tb-last">上次导入：{st!.last_import ?? '还没导入过'}</div>
+          {st!.reviews > 0 && (
+            <div className="unmatched-hint light" style={{ margin: '0 12px 8px' }} onClick={() => nav('/taobao/review')}>
+              同步后还有 {st!.reviews} 单待确认扣了哪些库存，去确认 ›
+            </div>
+          )}
           {todoCount === 0 && <Empty description="没有待办" />}
           {data.unmatched.length > 0 && (
             <List header={`有商品没对上的订单：只记了金额 ${money(st!.unmatched_amount)}，没扣库存、没算成本`}>

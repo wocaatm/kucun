@@ -16,6 +16,8 @@ interface Task {
 interface Status {
   token: string | null;
   last_seen: string | null;
+  /** 同步后还没确认的订单数 */
+  reviews: number;
   tasks: Task[];
 }
 
@@ -48,12 +50,17 @@ export default function PluginPage() {
   };
 
   const run = async (kind: Task['kind']) => {
+    if (kind === 'sync_orders' && data?.reviews) {
+      Toast.show(`上次同步还有 ${data.reviews} 单没确认，先确认完`);
+      return nav('/taobao/review');
+    }
     try {
       await post('/api/plugin/tasks', { kind });
       Toast.show(online(data?.last_seen ?? null) ? '已发给插件，一分钟内开始' : '已排上，插件上线后执行');
       load();
     } catch (e: any) {
       Toast.show({ content: e.message, icon: 'fail' });
+      if (/没确认/.test(e.message)) nav('/taobao/review');
     }
   };
 
@@ -88,6 +95,11 @@ export default function PluginPage() {
         </List.Item>
       </List>
 
+      {data.reviews > 0 && (
+        <div className="unmatched-hint light" style={{ margin: '12px 16px 0' }} onClick={() => nav('/taobao/review')}>
+          上次同步还有 {data.reviews} 单没确认，确认完才能再同步订单 ›
+        </div>
+      )}
       <div className="btn-row" style={{ padding: '12px 16px 0' }}>
         <Button color="primary" onClick={() => run('sync_orders')}>
           同步订单

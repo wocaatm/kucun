@@ -54,6 +54,7 @@ interface Dashboard {
     to_ship: number;
     unconfirmed_sku: number;
     pending_refunds: number;
+    reviews: number;
     last_import: string | null;
   };
 }
@@ -131,12 +132,13 @@ function TaobaoCard({ data }: { data: Dashboard }) {
   const t = data.taobao;
   const r = data.receivable;
   const todos = [
-    t.unmatched_orders > 0 && { text: `${t.unmatched_orders} 单有商品没对上`, tab: 'todo' },
-    t.unconfirmed_sku > 0 && { text: `${t.unconfirmed_sku} 个 SKU 待确认`, tab: 'sku' },
-    t.unchecked_orders > 0 && { text: `${t.unchecked_orders} 单要核对实发`, tab: 'todo' },
-    t.pending_refunds > 0 && { text: `${t.pending_refunds} 笔退款待确认`, tab: 'todo' },
-    t.to_ship > 0 && { text: `${t.to_ship} 单待发货`, tab: 'orders&group=to_ship' },
-  ].filter(Boolean) as { text: string; tab: string }[];
+    t.reviews > 0 && { text: `${t.reviews} 单同步后待确认`, to: '/taobao/review' },
+    t.unmatched_orders > 0 && { text: `${t.unmatched_orders} 单有商品没对上`, to: '/taobao?tab=todo' },
+    t.unconfirmed_sku > 0 && { text: `${t.unconfirmed_sku} 个 SKU 待确认`, to: '/taobao?tab=sku' },
+    t.unchecked_orders > 0 && { text: `${t.unchecked_orders} 单要核对实发`, to: '/taobao?tab=todo' },
+    t.pending_refunds > 0 && { text: `${t.pending_refunds} 笔退款待确认`, to: '/taobao?tab=todo' },
+    t.to_ship > 0 && { text: `${t.to_ship} 单待发货`, to: '/taobao?tab=orders&group=to_ship' },
+  ].filter(Boolean) as { text: string; to: string }[];
   if (!t.last_import && !r.count) return null;
   return (
     <div className="card">
@@ -154,7 +156,7 @@ function TaobaoCard({ data }: { data: Dashboard }) {
       {todos.length > 0 && (
         <div className="tb-todos">
           {todos.map((x) => (
-            <span key={x.text} onClick={() => nav(`/taobao?tab=${x.tab}`)}>
+            <span key={x.text} onClick={() => nav(x.to)}>
               {x.text}
             </span>
           ))}

@@ -216,7 +216,9 @@ export default function DocDetail() {
                   : [
                       i.spec,
                       i.raw_name && i.raw_name !== i.product_name ? `识别：${i.raw_name}` : '',
-                      doc.type === 'purchase'
+                      doc.type === 'purchase' && i.buy_qty != null
+                        ? `买 ${i.buy_qty} 件，入库 ${i.qty} 件，其余只记钱 · 均价 ${money(i.unit_price)}`
+                        : doc.type === 'purchase'
                         ? i.in_cost != null && i.in_cost !== i.amount
                           ? `标价 ${money(i.amount)} → 实付 ${money(i.in_cost)}（${money(Math.round(i.in_cost / i.qty))}/件）`
                           : `均价 ${money(i.unit_price)}`
@@ -237,7 +239,7 @@ export default function DocDetail() {
                   : doc.type === 'outbound'
                     ? `×${i.qty}`
                     : doc.type === 'purchase' || doc.type === 'sale_return'
-                      ? `${doc.type === 'purchase' ? `×${i.qty} 共 ` : '退 '}${money(i.amount)}`
+                      ? `${doc.type === 'purchase' ? `×${i.buy_qty ?? i.qty} 共 ` : '退 '}${money(i.amount)}`
                       : `${money(i.unit_price)} × ${i.qty}`
               }
             >

@@ -5,7 +5,7 @@ import { api, DOC_LABEL, get, money, type DocType, type TaobaoOrder } from '../a
 import { useSession } from '../store';
 import ProductsEditor, { pickedToInput, type PickedProduct, type Suggestion } from '../components/ProductsEditor';
 
-interface Sub {
+export interface Sub {
   sub_no: string;
   item_id: string;
   sku: string;
@@ -23,19 +23,19 @@ interface Sub {
   suggestions: Suggestion[];
 }
 
-interface OrderDetail {
+export interface OrderDetail {
   order: TaobaoOrder & { created_at: string | null; pending: boolean };
   subs: Sub[];
   actual: { custom: boolean; rows: PickedProduct[]; text: string };
   remark_suggestions: Suggestion[];
-  docs: { id: number; type: DocType; doc_date: string; amount: number; status: string; review: string; received: number | null }[];
+  docs: { id: number; type: DocType; doc_date: string; amount: number; status: string; review: string; received: number | null; ref_doc_id: number | null }[];
   logs: { created_at: string; detail: string; user_name: string | null }[];
   /** 有货已经退回来了：不能再改实发 */
   returned: boolean;
 }
 
 /** 按下单 SKU 对照算出来的发货商品（改实发时的起点） */
-function orderedProducts(subs: Sub[]): PickedProduct[] {
+export function orderedProducts(subs: Sub[]): PickedProduct[] {
   const out = new Map<number, PickedProduct>();
   for (const s of subs) {
     if (s.refund_status === '退款成功' && !s.shipped_at) continue;

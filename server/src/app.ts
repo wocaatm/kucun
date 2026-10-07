@@ -255,7 +255,7 @@ export function buildApp(opts: AppOptions) {
       .prepare(
         `SELECT d.id AS doc_id, d.type, d.doc_date, d.counterparty, d.channel, i.qty, COALESCE(i.in_cost, i.amount) AS cost, a.name AS account_name
          FROM doc_items i JOIN docs d ON d.id = i.doc_id LEFT JOIN accounts a ON a.id = d.account_id
-         WHERE i.product_id = ? AND d.status = 'active' AND d.type IN ('purchase', 'opening_stock')
+         WHERE i.product_id = ? AND d.status = 'active' AND d.type IN ('purchase', 'opening_stock') AND i.qty > 0
          ORDER BY d.doc_date DESC, d.id DESC`,
       )
       .all(id);
@@ -542,6 +542,7 @@ export function buildApp(opts: AppOptions) {
   async function importUpload(req: FastifyRequest) {
     const sheets: Record<string, Record<string, string>[]> = {};
     let dry = false;
+    let onlyData = false;
     const saved: { name: string; buf: Buffer }[] = [];
     for await (const part of req.parts()) {
       if (part.type === 'file') {
@@ -557,8 +558,9 @@ export function buildApp(opts: AppOptions) {
         sheets[kind] = rows;
         saved.push({ name: part.filename, buf });
       } else if (part.fieldname === 'dry') dry = String(part.value) === '1';
+      else if (part.fieldname === 'only_data') onlyData = String(part.value) === '1';
     }
-    const run = () => taobao.importTaobao(db, req.user.id, sheets.orders ?? [], sheets.items ?? []);
+    const run = () => taobao.importTaobao(db, req.user.id, sheets.orders ?? [], sheets.items ?? [], { only_data: onlyData });
     const report = dry ? dryRun(db, run) : run();
     if (!dry) {
       // 原始文件留档，方便事后对账
@@ -612,6 +614,11 @@ export function buildApp(opts: AppOptions) {
   });
 
   app.post('/api/taobao/sku-map/confirm-all', async (req) => ({ result: taobao.confirmAllSkus(db, req.user.id) }));
+
+  // 同步待确认：逐单确认新增 / 状态变了的订单扣了哪些库存
+  app.get('/api/taobao/reviews', async () => ({ items: taobao.listReviews(db) }));
+  app.post('/api/taobao/reviews/confirm-all', async (req) => taobao.confirmAllReviews(db, req.user.id));
+  app.post('/api/taobao/reviews/:no/confirm', async (req) => taobao.confirmReview(db, req.user.id, (req.params as any).no as string));
 
   app.get('/api/taobao/orders', async (req) => {
     const { group = '', q = '', offset = '0' } = req.query as Record<string, string>;

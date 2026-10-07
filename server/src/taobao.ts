@@ -415,11 +415,14 @@ interface SubRow {
   shipped_at: string | null;
   sale_doc_id: number | null;
   refund_doc_id: number | null;
+  baseline: number;
 }
 
 /** 未确定商品的金额在销售单上的前缀：计入销售额，但不扣库存 */
 export const UNMATCHED_PREFIX = '未匹配：';
 export const UNCHECKED_PREFIX = '待核对实发：';
+/** 同步后还没确认的订单：先只记金额，确认后才按确认的商品扣库存 */
+export const REVIEW_PREFIX = '待确认：';
 
 /** 未关联商品的货款行：计入销售额（空包、实发放在同订单另一张销售单上） */
 export const GOODS_PREFIX = '货款：';
@@ -444,7 +447,12 @@ function buildSale(db: DB, o: any, subs: SubRow[]) {
     qty: number;
   }[];
   const extra: { name: string; amount: number }[] = [];
-  if (actualPending(o)) {
+  if (subs.every((s) => s.baseline)) {
+    // 「只同步订单数据」时已经发货的：照算销售额、进公共资金，不扣库存（库存当作已经盘点对齐）
+    extra.push({ name: `${GOODS_PREFIX}初始化同步，不扣库存`, amount: subs.reduce((t, x) => t + x.paid, 0) });
+  } else if (pendingReview(db, o.order_no)) {
+    for (const s of subs) unresolved.push({ name: `${REVIEW_PREFIX}${skuLabel(s.sku) || s.title} ×${s.qty}`, amount: s.paid });
+  } else if (actualPending(o)) {
     for (const s of subs) unresolved.push({ name: `${UNCHECKED_PREFIX}${skuLabel(s.sku) || s.title} ×${s.qty}`, amount: s.paid });
   } else if (o.actual_custom) {
     // 实发按订单填，只挂在最先发货的那张销售单上；空包或同订单的其他销售单只记货款
@@ -475,8 +483,10 @@ function buildSale(db: DB, o: any, subs: SubRow[]) {
 
 /** 这张（有未匹配项的）销售单现在是否能多确定一些商品 */
 function canResolveMore(db: DB, o: any, subs: SubRow[], docId: number): boolean {
-  if (actualPending(o)) return false;
+  if (pendingReview(db, o.order_no)) return false;
   const lines = db.prepare('SELECT name FROM doc_adjustments WHERE doc_id = ?').all(docId) as { name: string }[];
+  if (lines.some((l) => l.name.startsWith(REVIEW_PREFIX))) return true; // 刚确认
+  if (actualPending(o)) return false;
   if (lines.some((l) => l.name.startsWith(UNCHECKED_PREFIX))) return true; // 实发刚确认
   if (o.actual_custom) return false;
   const withItems = new Set(
@@ -549,6 +559,45 @@ function moveReturns(db: DB, oldId: number, newId: number) {
   }
 }
 
+/** 已发货、还没生成销售单的子订单，按主订单生成销售单；only 给了就只处理这些订单 */
+function createSales(db: DB, userId: number, res: ProcessResult, only?: Set<string>) {
+  const pendingOrders = (
+    db
+      .prepare(
+        `SELECT o.* FROM taobao_orders o WHERE EXISTS (
+           SELECT 1 FROM taobao_sub_orders s WHERE s.order_no = o.order_no AND s.shipped_at IS NOT NULL AND s.sale_doc_id IS NULL)
+         ORDER BY o.shipped_at, o.order_no`,
+      )
+      .all() as any[]
+  ).filter((o) => !only || only.has(o.order_no));
+  for (const o of pendingOrders) {
+    const all = db.prepare('SELECT * FROM taobao_sub_orders WHERE order_no = ? ORDER BY sub_no').all(o.order_no) as unknown as SubRow[];
+    const subs = all.filter((s) => s.shipped_at && !s.sale_doc_id);
+    // 邮费（主订单实付与子订单实付的差额）挂在这个订单的第一张销售单上
+    const first = !all.some((s) => s.sale_doc_id);
+    const goods = all.filter((s) => s.shipped_at || s.refund_status !== REFUND_OK).reduce((t, x) => t + x.paid, 0);
+    const postage = first ? (o.paid > 0 ? Math.max(0, o.paid - goods) : o.postage) : 0;
+    try {
+      res.created_sales.push(tx(db, () => writeSale(db, userId, o, subs, postage)));
+    } catch (e: any) {
+      res.errors.push(`订单 ${o.order_no}：${e.message}`);
+    }
+  }
+}
+
+/** 交易成功 → 销售单标到账 */
+function markReceived(db: DB): number {
+  return Number(
+    db
+      .prepare(
+        `UPDATE docs SET received = 1, received_at = (SELECT confirmed_at FROM taobao_orders o WHERE o.order_no = docs.source_ref)
+         WHERE source = 'taobao' AND type = 'sale' AND received = 0 AND status = 'active'
+           AND source_ref IN (SELECT order_no FROM taobao_orders WHERE status = ?)`,
+      )
+      .run(TB_SUCCESS).changes,
+  );
+}
+
 /** 根据已导入的原始数据补齐单据：发货 → 销售，交易成功 → 到账，发货后退款 → 待处理退款 */
 export function processTaobao(db: DB, userId: number): ProcessResult {
   const res: ProcessResult = { created_sales: [], rebuilt_sales: [], received: 0, refunds: [], errors: [] };
@@ -572,37 +621,10 @@ export function processTaobao(db: DB, userId: number): ProcessResult {
   }
 
   // 2. 已发货、还没生成销售单的子订单，按主订单生成
-  const pendingOrders = db
-    .prepare(
-      `SELECT o.* FROM taobao_orders o WHERE EXISTS (
-         SELECT 1 FROM taobao_sub_orders s WHERE s.order_no = o.order_no AND s.shipped_at IS NOT NULL AND s.sale_doc_id IS NULL)
-       ORDER BY o.shipped_at, o.order_no`,
-    )
-    .all() as any[];
-  for (const o of pendingOrders) {
-    const all = subsOf(o.order_no);
-    const subs = all.filter((s) => s.shipped_at && !s.sale_doc_id);
-    // 邮费（主订单实付与子订单实付的差额）挂在这个订单的第一张销售单上
-    const first = !all.some((s) => s.sale_doc_id);
-    const goods = all.filter((s) => s.shipped_at || s.refund_status !== REFUND_OK).reduce((t, x) => t + x.paid, 0);
-    const postage = first ? (o.paid > 0 ? Math.max(0, o.paid - goods) : o.postage) : 0;
-    try {
-      res.created_sales.push(tx(db, () => writeSale(db, userId, o, subs, postage)));
-    } catch (e: any) {
-      res.errors.push(`订单 ${o.order_no}：${e.message}`);
-    }
-  }
+  createSales(db, userId, res);
 
   // 3. 交易成功 → 到账
-  res.received = Number(
-    db
-      .prepare(
-        `UPDATE docs SET received = 1, received_at = (SELECT confirmed_at FROM taobao_orders o WHERE o.order_no = docs.source_ref)
-         WHERE source = 'taobao' AND type = 'sale' AND received = 0 AND status = 'active'
-           AND source_ref IN (SELECT order_no FROM taobao_orders WHERE status = ?)`,
-      )
-      .run(TB_SUCCESS).changes,
-  );
+  res.received = markReceived(db);
 
   // 4. 发货后退款成功 → 待处理退款（默认仅退款，货未退回）
   const refunds = db
@@ -645,6 +667,128 @@ export function processTaobao(db: DB, userId: number): ProcessResult {
   return res;
 }
 
+// ---------------------------------------------------------------- 同步待确认
+
+interface OrderState {
+  status: string;
+  /** 已发货的子订单 */
+  shipped: Set<string>;
+  /** 发货后退款成功的子订单 → 规格名 */
+  refunded: Map<string, string>;
+}
+
+/** 导入前这批订单的状态（没有的就是新订单） */
+function snapshot(db: DB, orderNos: string[]): Map<string, OrderState | null> {
+  const ord = db.prepare('SELECT status FROM taobao_orders WHERE order_no = ?');
+  // 「只同步订单数据」时标过 baseline 的不算：库存早算过了，发货 / 退款都不用再确认
+  const subs = db.prepare('SELECT sub_no, sku, title, refund_status FROM taobao_sub_orders WHERE order_no = ? AND shipped_at IS NOT NULL AND baseline = 0');
+  const out = new Map<string, OrderState | null>();
+  for (const no of orderNos) {
+    const o = ord.get(no) as { status: string } | undefined;
+    const rows = subs.all(no) as { sub_no: string; sku: string; title: string; refund_status: string }[];
+    out.set(
+      no,
+      o
+        ? {
+            status: o.status,
+            shipped: new Set(rows.map((s) => s.sub_no)),
+            refunded: new Map(rows.filter((s) => s.refund_status === REFUND_OK).map((s) => [s.sub_no, skuLabel(s.sku) || s.title])),
+          }
+        : null,
+    );
+  }
+  return out;
+}
+
+/**
+ * 导入后比对，影响库存的才记成待确认（已确认过的重新打开，没确认的追加变化）：
+ * - 有子订单从没发货变成已发货（新订单直接就是已发货的也算）= 要扣库存
+ * - 发了货的子订单退款成功 = 要确认货有没有退回来入库
+ * 没发货的、只是交易成功的不影响库存，不进待确认。
+ */
+function recordReviews(db: DB, before: Map<string, OrderState | null>) {
+  const up = db.prepare(
+    `INSERT INTO taobao_reviews (order_no, changes) VALUES (?, ?)
+     ON CONFLICT(order_no) DO UPDATE SET
+       changes = CASE WHEN confirmed_at IS NULL THEN changes || char(10) || excluded.changes ELSE excluded.changes END,
+       created_at = CASE WHEN confirmed_at IS NULL THEN created_at ELSE datetime('now', 'localtime') END,
+       confirmed_at = NULL, confirmed_by = NULL`,
+  );
+  const after = snapshot(db, [...before.keys()]);
+  for (const [no, old] of before) {
+    const cur = after.get(no);
+    if (!cur) continue;
+    const changes: string[] = [];
+    if ([...cur.shipped].some((s) => !old?.shipped.has(s)))
+      changes.push(!old ? `新订单：${cur.status}` : old.status !== cur.status ? `${old.status} → ${cur.status}` : `又发了货：${cur.status}`);
+    for (const [sub, label] of cur.refunded) if (!old?.refunded.has(sub)) changes.push(`退款成功：${label}`);
+    if (changes.length) up.run(no, changes.join('；'));
+  }
+}
+
+/** 这单还不能直接确认的原因：实发没核对 / 有发出的商品没对上库存商品 */
+function reviewIssue(db: DB, o: any): string | null {
+  const shipped = db.prepare('SELECT * FROM taobao_sub_orders WHERE order_no = ? AND shipped_at IS NOT NULL AND baseline = 0').all(o.order_no) as unknown as SubRow[];
+  if (!shipped.length) return null;
+  const refund = db
+    .prepare(
+      `SELECT 1 FROM docs r JOIN docs s ON s.id = r.ref_doc_id
+       WHERE r.type = 'sale_return' AND r.review = 'pending' AND r.status = 'active' AND s.source = 'taobao' AND s.source_ref = ?`,
+    )
+    .get(o.order_no);
+  if (refund) return '有退款，先确认货有没有退回来';
+  if (actualPending(o)) return '有商家备注，先核对实发';
+  if (!o.actual_custom && shipped.some((s) => !confirmedMap(db, s).length)) return '有商品没对上库存商品，先对照或改实发';
+  return null;
+}
+
+const pendingReview = (db: DB, orderNo: string) =>
+  db.prepare('SELECT * FROM taobao_reviews WHERE order_no = ? AND confirmed_at IS NULL').get(orderNo) as
+    | { order_no: string; changes: string; created_at: string }
+    | undefined;
+
+/** 待确认的订单，带订单详情（下单、实发、生成的单据）和不能直接确认的原因 */
+export function listReviews(db: DB) {
+  const rows = db.prepare('SELECT * FROM taobao_reviews WHERE confirmed_at IS NULL ORDER BY created_at, order_no').all() as {
+    order_no: string;
+    changes: string;
+    created_at: string;
+  }[];
+  return rows.map((r) => {
+    const detail = getOrder(db, r.order_no)!;
+    return { ...detail, changes: r.changes.split('\n'), review_at: r.created_at, issue: reviewIssue(db, detail.order) };
+  });
+}
+
+export function confirmReview(db: DB, userId: number, orderNo: string) {
+  return tx(db, () => {
+    if (!pendingReview(db, orderNo)) throw new BizError('这单没有待确认的变化');
+    const o = db.prepare('SELECT * FROM taobao_orders WHERE order_no = ?').get(orderNo);
+    const issue = reviewIssue(db, o);
+    if (issue) throw new BizError(issue);
+    db.prepare("UPDATE taobao_reviews SET confirmed_at = datetime('now', 'localtime'), confirmed_by = ? WHERE order_no = ?").run(userId, orderNo);
+    log(db, userId, 'taobao_review', orderNo);
+    const r = processTaobao(db, userId); // 确认了才按确认的商品重建销售单、扣库存
+    return { left: pendingReviews(db), rebuilt_sales: r.rebuilt_sales, errors: r.errors };
+  });
+}
+
+/** 一键确认：只确认没问题的，有问题的留着 */
+export function confirmAllReviews(db: DB, userId: number) {
+  return tx(db, () => {
+    const rows = db.prepare('SELECT o.* FROM taobao_reviews r JOIN taobao_orders o ON o.order_no = r.order_no WHERE r.confirmed_at IS NULL').all() as any[];
+    const ok = rows.filter((o) => !reviewIssue(db, o));
+    const st = db.prepare("UPDATE taobao_reviews SET confirmed_at = datetime('now', 'localtime'), confirmed_by = ? WHERE order_no = ?");
+    for (const o of ok) st.run(userId, o.order_no);
+    log(db, userId, 'taobao_review_all', '', { n: ok.length });
+    const r = processTaobao(db, userId);
+    return { confirmed: ok.length, left: pendingReviews(db), rebuilt_sales: r.rebuilt_sales, errors: r.errors };
+  });
+}
+
+export const pendingReviews = (db: DB) =>
+  (db.prepare('SELECT COUNT(*) n FROM taobao_reviews WHERE confirmed_at IS NULL').get() as { n: number }).n;
+
 // ---------------------------------------------------------------- 导入入口
 
 export interface ImportReport extends ProcessResult {
@@ -654,16 +798,33 @@ export interface ImportReport extends ProcessResult {
   unmatched_orders: number;
   unmatched_amount: number;
   to_ship: number;
+  /** 待确认的订单数（含这次之前没确认完的） */
+  reviews: number;
+  /** 只同步订单数据时：标成「库存已算过」的已发货子订单数 */
+  baseline?: number;
   negative: { id: number; name: string; stock_qty: number }[];
 }
 
-export function importTaobao(db: DB, userId: number, orderRows: Record<string, string>[], itemRows: Record<string, string>[]): ImportReport {
+/**
+ * opts.only_data = 只同步订单数据（初始化用）：写入订单、更新状态和到账；已发货的照样生成销售单、算销售额进公共资金，
+ * 但不扣库存，也不生成待确认 / SKU 待办。这次已经发货的子订单标成 baseline，以后重建也不扣；还没发货的以后发货照常处理。
+ */
+export function importTaobao(
+  db: DB,
+  userId: number,
+  orderRows: Record<string, string>[],
+  itemRows: Record<string, string>[],
+  opts: { only_data?: boolean } = {},
+): ImportReport {
   if (!orderRows.length || detectSheet(orderRows) !== 'orders') throw new BizError('缺少主订单表（含「订单编号」「买家应付邮费」列）');
   if (!itemRows.length || detectSheet(itemRows) !== 'items') throw new BizError('缺少子订单表（含「子订单编号」「主订单编号」列）');
   return tx(db, () => {
+    const before = snapshot(db, orderRows.map((r) => r['订单编号']).filter(Boolean));
     upsertOrders(db, orderRows);
     upsertSubs(db, itemRows);
+    if (opts.only_data) return importDataOnly(db, userId, orderRows, itemRows);
     const autoMapped = autoMapSkus(db);
+    recordReviews(db, before); // 先记待确认，生成销售单时这些单先不扣库存
     const r = processTaobao(db, userId);
     const s = taobaoStatus(db);
     log(db, userId, 'taobao_import', '', {
@@ -683,9 +844,54 @@ export function importTaobao(db: DB, userId: number, orderRows: Record<string, s
       unmatched_orders: s.unmatched_orders,
       unmatched_amount: s.unmatched_amount,
       to_ship: s.to_ship,
+      reviews: s.reviews,
       negative: db.prepare('SELECT id, name, stock_qty FROM products WHERE stock_qty < 0 ORDER BY stock_qty').all() as any[],
     };
   });
+}
+
+function importDataOnly(db: DB, userId: number, orderRows: Record<string, string>[], itemRows: Record<string, string>[]): ImportReport {
+  const mark = db.prepare('UPDATE taobao_sub_orders SET baseline = 1 WHERE order_no = ? AND shipped_at IS NOT NULL AND sale_doc_id IS NULL AND baseline = 0');
+  let baseline = 0;
+  for (const no of new Set(orderRows.map((r) => r['订单编号']).filter(Boolean))) baseline += Number(mark.run(no).changes);
+  const res: ProcessResult = { created_sales: [], rebuilt_sales: [], received: 0, refunds: [], errors: [] };
+  const orders = new Set(orderRows.map((r) => r['订单编号']));
+  createSales(db, userId, res, orders);
+  // 已经退款成功的：只退钱、直接算已处理（不进待办；货有没有回来以盘点为准）
+  const refunded = db
+    .prepare(
+      `SELECT * FROM taobao_sub_orders WHERE refund_status = ? AND refund > 0 AND sale_doc_id IS NOT NULL AND refund_doc_id IS NULL AND baseline = 1`,
+    )
+    .all(REFUND_OK) as unknown as SubRow[];
+  for (const x of refunded.filter((x) => orders.has(x.order_no))) {
+    try {
+      const docId = createReturn(db, userId, x.sale_doc_id!, {
+        items: [],
+        extra: [{ name: `退款：${skuLabel(x.sku) || x.title}`, amount: x.refund }],
+        doc_date: today(),
+        note: `淘宝退款 子订单 ${x.sub_no}（初始化同步，不动库存）`,
+      });
+      db.prepare('UPDATE taobao_sub_orders SET refund_doc_id = ? WHERE sub_no = ?').run(docId, x.sub_no);
+      res.refunds.push(docId);
+    } catch (e: any) {
+      res.errors.push(`子订单 ${x.sub_no} 退款：${e.message}`);
+    }
+  }
+  res.received = markReceived(db);
+  const s = taobaoStatus(db);
+  log(db, userId, 'taobao_import', '', { orders: orderRows.length, subs: itemRows.length, only_data: true, baseline, sales: res.created_sales.length, received: res.received, errors: res.errors });
+  return {
+    ...res,
+    orders: orderRows.length,
+    sub_orders: itemRows.length,
+    auto_mapped: 0,
+    unmatched_orders: s.unmatched_orders,
+    unmatched_amount: s.unmatched_amount,
+    to_ship: s.to_ship,
+    reviews: s.reviews,
+    baseline,
+    negative: [],
+  };
 }
 
 // ---------------------------------------------------------------- 查询
@@ -695,10 +901,13 @@ export function taobaoStatus(db: DB) {
   const one = (sql: string, ...p: string[]) => (db.prepare(sql).get(...p) as { n: number }).n;
   return {
     /** 有商品没确定（没扣库存）的淘宝销售单数，以及这部分金额 */
-    unmatched_orders: one("SELECT COUNT(*) n FROM docs WHERE type = 'sale' AND source = 'taobao' AND status = 'active' AND review = 'unmatched'"),
+    unmatched_orders: one(
+      "SELECT COUNT(*) n FROM docs d WHERE type = 'sale' AND source = 'taobao' AND status = 'active' AND review = 'unmatched' AND NOT EXISTS (SELECT 1 FROM taobao_reviews r WHERE r.order_no = d.source_ref AND r.confirmed_at IS NULL)",
+    ),
     unmatched_amount: one(
       `SELECT COALESCE(SUM(j.amount), 0) n FROM doc_adjustments j JOIN docs d ON d.id = j.doc_id
-       WHERE d.type = 'sale' AND d.source = 'taobao' AND d.status = 'active' AND d.review = 'unmatched' AND (j.name LIKE ? OR j.name LIKE ? OR j.name = '邮费')`,
+       WHERE d.type = 'sale' AND d.source = 'taobao' AND d.status = 'active' AND d.review = 'unmatched' AND (j.name LIKE ? OR j.name LIKE ? OR j.name = '邮费')
+         AND NOT EXISTS (SELECT 1 FROM taobao_reviews r WHERE r.order_no = d.source_ref AND r.confirmed_at IS NULL)`,
       `${UNMATCHED_PREFIX}%`,
       `${UNCHECKED_PREFIX}%`,
     ),
@@ -709,6 +918,8 @@ export function taobaoStatus(db: DB) {
     to_ship: one('SELECT COUNT(*) n FROM taobao_orders WHERE status = ?', TB_TO_SHIP),
     unconfirmed_sku: one('SELECT COUNT(DISTINCT item_id || sku) n FROM taobao_sku_map WHERE confirmed = 0'),
     pending_refunds: one("SELECT COUNT(*) n FROM docs WHERE type = 'sale_return' AND review = 'pending' AND status = 'active'"),
+    /** 同步后还没确认的订单：有就不让再同步 */
+    reviews: pendingReviews(db),
     last_import: (db.prepare("SELECT MAX(created_at) v FROM logs WHERE action = 'taobao_import'").get() as { v: string | null }).v,
   };
 }
@@ -773,7 +984,8 @@ export function listUnmatched(db: DB) {
   const docs = db
     .prepare(
       `SELECT d.id, d.doc_date, d.source_ref, d.amount, o.remark FROM docs d LEFT JOIN taobao_orders o ON o.order_no = d.source_ref
-       WHERE d.type = 'sale' AND d.source = 'taobao' AND d.status = 'active' AND d.review = 'unmatched' ORDER BY d.doc_date, d.id`,
+       WHERE d.type = 'sale' AND d.source = 'taobao' AND d.status = 'active' AND d.review = 'unmatched' AND NOT EXISTS (SELECT 1 FROM taobao_reviews r WHERE r.order_no = d.source_ref AND r.confirmed_at IS NULL)
+       ORDER BY d.doc_date, d.id`,
     )
     .all() as any[];
   const lines = db.prepare("SELECT name, amount FROM doc_adjustments WHERE doc_id = ? AND (name LIKE ? OR name LIKE ? OR name = '邮费') ORDER BY id");
@@ -857,7 +1069,7 @@ export function getOrder(db: DB, orderNo: string) {
   }));
   const docs = db
     .prepare(
-      `SELECT id, type, doc_date, amount, status, review, received FROM docs
+      `SELECT id, type, doc_date, amount, status, review, received, ref_doc_id FROM docs
        WHERE source = 'taobao' AND source_ref = ? ORDER BY id`,
     )
     .all(orderNo);

@@ -168,6 +168,7 @@ function migrate(db: DB) {
   addTo('doc_items', 'ref_item_id', 'INTEGER'); // 退货明细 → 原销售明细
   addTo('doc_items', 'in_cost', 'INTEGER'); // 退货明细：退回入库的成本（用户可改）
   addTo('doc_items', 'source_ref', 'TEXT'); // 淘宝销售明细：子订单号
+  addTo('doc_items', 'buy_qty', 'INTEGER'); // 进货买入数：只有入库数（qty）比它少时才有，NULL = 和 qty 一样
   db.exec('CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source, source_ref)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_docs_ref ON docs(ref_doc_id)');
 
@@ -203,6 +204,8 @@ function migrate(db: DB) {
     refund_doc_id INTEGER
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_tb_sub_order ON taobao_sub_orders(order_no)');
+  // 1 = 「只同步订单数据」导入时已经发了货：当作库存里已经算过（盘点对齐），以后也不再生成销售单、不扣库存
+  addTo('taobao_sub_orders', 'baseline', 'INTEGER NOT NULL DEFAULT 0');
   // 淘宝 SKU（商品ID + 规格）→ 库存商品 × 件数；套装对应多行。confirmed = 0 是自动匹配、待确认
   db.exec(`CREATE TABLE IF NOT EXISTS taobao_sku_map (
     item_id TEXT NOT NULL,
@@ -239,6 +242,14 @@ function migrate(db: DB) {
     price INTEGER NOT NULL DEFAULT 0,
     synced_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     PRIMARY KEY (item_id, sku_id)
+  )`);
+  // 同步待确认：每次导入里新出现 / 状态变了的订单，要人逐单确认扣了哪些库存（confirmed_at 为空 = 待确认）
+  db.exec(`CREATE TABLE IF NOT EXISTS taobao_reviews (
+    order_no TEXT PRIMARY KEY,
+    changes TEXT NOT NULL DEFAULT '',      -- 这期间的变化，一行一次
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    confirmed_at TEXT,
+    confirmed_by INTEGER
   )`);
   migrateAgent(db);
   // v1：成本改为按单据日期重放，全部商品重算一次

@@ -15,6 +15,7 @@ import DocDetail from './pages/DocDetail';
 import ReturnPage from './pages/ReturnPage';
 import TaobaoPage from './pages/TaobaoPage';
 import TaobaoOrderPage from './pages/TaobaoOrderPage';
+import TaobaoReviewPage from './pages/TaobaoReviewPage';
 import PluginPage from './pages/PluginPage';
 import Me, { BackupPage, LogsPage, OpeningPage, PasswordPage } from './pages/Me';
 
@@ -67,6 +68,7 @@ function Shell() {
         <Route path="/docs/:id/return" element={<ReturnPage />} />
         <Route path="/taobao" element={<TaobaoPage />} />
         <Route path="/taobao/orders/:no" element={<TaobaoOrderPage />} />
+        <Route path="/taobao/review" element={<TaobaoReviewPage />} />
         <Route path="/plugin" element={<PluginPage />} />
         <Route path="/me" element={<Me />} />
         <Route path="/opening" element={<OpeningPage />} />

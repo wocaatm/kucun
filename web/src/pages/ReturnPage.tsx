@@ -111,7 +111,8 @@ export default function ReturnPage() {
       });
       Toast.show({ content: '已记录', icon: 'success' });
       refreshMeta();
-      nav(`/docs/${r.doc.id}`, { replace: true });
+      // 从同步待确认页点进来的，确认完回那里接着处理
+      nav(params.get('back') === 'review' ? '/taobao/review' : `/docs/${r.doc.id}`, { replace: true });
     } catch (e: any) {
       Toast.show({ content: e.message, icon: 'fail' });
     } finally {

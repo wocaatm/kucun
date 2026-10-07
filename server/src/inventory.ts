@@ -83,7 +83,7 @@ export function replayProduct(db: DB, productId: number) {
     if (IN_TYPES.has(row.type)) {
       // 进货按实付成本入库（优惠 / 运费已按金额比例摊到每行，存在 in_cost）
       const c = row.in_cost ?? row.amount;
-      stockIn(row.qty, c);
+      if (row.qty > 0) stockIn(row.qty, c); // 入库数为 0 的进货行只记钱，不进库存
       cost.set(row.id, c);
       costPending.set(row.id, 0);
     } else if (OUT_TYPES.has(row.type)) {

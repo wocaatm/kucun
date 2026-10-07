@@ -414,3 +414,41 @@ test('识别结果前面多了一段 JSON 也能解析', async () => {
   assert.equal(r.items[0].name, 'a {x}');
   assert.equal(r.total, 53.5);
 });
+
+test('进货入库数可以比买入数少（含 0）：库存只进入库的，均价按买入数算，钱照记在付款人账上', async () => {
+  const p = await product('入库数测试 巧克力');
+  const q = await product('入库数测试 饼干');
+  const before = await balances();
+  const { doc } = await api('POST', '/api/docs', {
+    type: 'purchase',
+    account_id: acc['卢琼'],
+    items: [
+      { product_id: p, qty: 3, amount: 3000, in_qty: 1 },
+      { product_id: q, qty: 2, amount: 1000, in_qty: 0 },
+    ],
+  });
+  assert.equal(doc.amount, 4000);
+  assert.equal((await balances())['卢琼'] - before['卢琼'], -4000); // 钱全额算他垫付
+  const sp = await stock(p);
+  assert.equal(sp.stock_qty, 1);
+  assert.equal(sp.stock_value, 1000); // 单价 = 3000 / 3
+  assert.equal(sp.avg_cost, 1000);
+  assert.equal((await stock(q)).stock_qty, 0);
+  const items = doc.items.sort((a: any, b: any) => a.product_id - b.product_id);
+  assert.deepEqual(
+    items.map((i: any) => [i.qty, i.buy_qty, i.unit_price, i.in_cost]),
+    [
+      [1, 3, 1000, 1000],
+      [0, 2, 500, 0],
+    ],
+  );
+  // 商品进货记录里不列入库 0 的
+  assert.equal((await api('GET', `/api/products/${q}`)).purchases.length, 0);
+  await assert.rejects(
+    api('POST', '/api/docs', { type: 'purchase', account_id: acc['卢琼'], items: [{ product_id: p, qty: 1, amount: 100, in_qty: 2 }] }),
+    /入库数/,
+  );
+  // 作废后库存回到 0
+  await api('POST', `/api/docs/${doc.id}/void`, { reason: '测试' });
+  assert.equal((await stock(p)).stock_qty, 0);
+});

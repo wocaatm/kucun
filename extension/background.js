@@ -2,9 +2,9 @@
 // - 到了每天的同步时间：导出订单报表 + 宝贝明细报表，下载后上传到小库存（和手动导入 Excel 同一条路）
 // - 小库存页面上点了「同步订单 / 拉取商品 SKU」：来这里领任务执行
 // 订单同步分几步跨越多次唤醒（千牛两次导出要隔 5 分钟），进度存在 storage 里
-import { Taobao, SOLD_URL } from './taobao.js';
+import { Taobao, SOLD_URL, LOGIN_RE } from './taobao.js';
 
-const DEFAULTS = { server: 'https://kucun.kidslearnenglish.xyz', token: '', dailyAt: '21:30' };
+const DEFAULTS = { server: 'https://kucun.kidslearnenglish.xyz', token: '', dailyAt: '21:30', tbUser: '', tbPass: '' };
 const EXPORT_GAP = 5.5 * 60 * 1000; // 两次导出间隔（千牛要求 ≥ 5 分钟）
 const ORDER_TIMEOUT = 40 * 60 * 1000;
 const STEP_DELAY = 1200; // 连续请求之间停一下，别刷太快触发风控
@@ -39,24 +39,125 @@ async function server(path, body, form) {
 
 // ---------------------------------------------------------------- 千牛标签页
 
-/** 找一个已打开的千牛页面；没有就在后台开一个（任务结束后关掉） */
+const LOGIN_WAIT = 30 * 60 * 1000; // 弹了滑块 / 短信等人处理，最多等这么久
+
+/** 找一个已打开的千牛页面（含跳到登录页的）；没有就在后台开一个（任务结束后关掉） */
 async function taobaoTab(job) {
-  const tabs = await chrome.tabs.query({ url: ['https://myseller.taobao.com/*', 'https://qn.taobao.com/*'] });
+  if (job.ownTab) {
+    const t = await chrome.tabs.get(job.ownTab).catch(() => null);
+    if (t) return waitLoaded(t.id);
+  }
+  const tabs = await chrome.tabs.query({ url: ['https://myseller.taobao.com/*', 'https://qn.taobao.com/*', 'https://loginmyseller.taobao.com/*'] });
   const open = tabs.find((t) => t.status === 'complete');
   if (open) return open.id;
   const tab = await chrome.tabs.create({ url: SOLD_URL, active: false });
   job.ownTab = tab.id;
   await store.set('job', job);
+  return waitLoaded(tab.id);
+}
+
+async function waitLoaded(tabId) {
   for (let i = 0; i < 60; i++) {
-    const t = await chrome.tabs.get(tab.id);
-    if (t.status === 'complete') {
-      if (/login/.test(t.url ?? '')) throw new Error('千牛没登录或登录过期，请在浏览器里重新登录千牛');
-      return tab.id;
-    }
+    const t = await chrome.tabs.get(tabId);
+    if (t.status === 'complete') return tabId;
     await sleep(500);
   }
   throw new Error('打开千牛页面超时');
 }
+
+const onLoginPage = async (tabId) => LOGIN_RE.test((await chrome.tabs.get(tabId)).url ?? '');
+
+/** 在登录 iframe 里填账号密码、点登录（在页面里执行；找不到表单返回 false） */
+function fillLogin(user, pass) {
+  const id = document.querySelector('#fm-login-id');
+  const pw = document.querySelector('#fm-login-password');
+  const btn = document.querySelector('button.fm-submit');
+  if (!id || !pw || !btn) return false;
+  // 登录表单是 React 写的：要用原生 setter 赋值再发 input 事件，它才认
+  const set = (el, v) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  set(id, user);
+  set(pw, pass);
+  btn.click();
+  return true;
+}
+
+/**
+ * 保证千牛登着：没登录就用插件里填的账号密码自动登录一次；
+ * 淘宝弹了滑块 / 短信验证就把页面切到前台、发通知等人处理（插件不碰验证），登上后自动继续。
+ * 返回 true = 可以干活；false = 还在等人登录（任务留着，下次唤醒再看）。
+ */
+async function ensureLogin(job, tabId) {
+  if (!(await onLoginPage(tabId))) {
+    if (job.waitLogin) {
+      delete job.waitLogin;
+      await log('千牛已登录，继续');
+    }
+    return true;
+  }
+  const cfg = await config();
+  if (!job.loginTried) {
+    if (!cfg.tbUser || !cfg.tbPass) throw new Error('千牛登录过期，插件里没填千牛账号密码，请在浏览器里登录千牛后再试');
+    job.loginTried = Date.now();
+    await store.set('job', job);
+    await log('千牛登录过期，自动登录');
+    // 登录表单在 iframe 里，等它加载出来
+    let filled = false;
+    for (let i = 0; i < 20 && !filled; i++) {
+      await sleep(1000);
+      const res = await chrome.scripting
+        .executeScript({ target: { tabId, allFrames: true }, func: fillLogin, args: [cfg.tbUser, cfg.tbPass] })
+        .catch(() => []);
+      filled = res.some((r) => r.result);
+    }
+    if (filled) {
+      for (let i = 0; i < 20; i++) {
+        await sleep(1000);
+        if (!(await onLoginPage(tabId))) {
+          await log('自动登录成功');
+          if (!/trade-platform/.test((await chrome.tabs.get(tabId)).url ?? '')) {
+            await chrome.tabs.update(tabId, { url: SOLD_URL });
+            await sleep(1000);
+            await waitLoaded(tabId);
+          }
+          return true;
+        }
+      }
+    }
+  }
+  // 自动登录没成（多半是要滑块 / 短信验证）：叫人来
+  if (!job.waitLogin) {
+    job.waitLogin = Date.now();
+    await store.set('job', job);
+    const tab = await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+    chrome.notifications.create('login', {
+      type: 'basic',
+      iconUrl: 'icon.png',
+      title: '小库存 · 千牛要登录',
+      message: '淘宝要求验证（滑块或短信），请在打开的千牛页面完成登录，插件登上后自动继续同步',
+      requireInteraction: true,
+    });
+    await log('自动登录需要验证，已提醒手动完成');
+  }
+  if (Date.now() - job.waitLogin > LOGIN_WAIT) throw new Error('等千牛登录超时（需要手动完成滑块 / 短信验证）');
+  return false;
+}
+
+// 点通知：切到千牛登录页
+chrome.notifications.onClicked.addListener(async (id) => {
+  if (id !== 'login') return;
+  const job = await store.get('job', null);
+  const tabs = await chrome.tabs.query({ url: ['https://loginmyseller.taobao.com/*', 'https://myseller.taobao.com/*'] });
+  const t = (job?.ownTab && tabs.find((x) => x.id === job.ownTab)) || tabs[0];
+  if (t) {
+    await chrome.tabs.update(t.id, { active: true });
+    await chrome.windows.update(t.windowId, { focused: true }).catch(() => {});
+  }
+});
 
 // ---------------------------------------------------------------- 任务
 
@@ -136,6 +237,7 @@ async function upload(tb, orders, items) {
 
 async function finish(job, ok, message) {
   await store.set('job', null);
+  chrome.notifications.clear('login');
   if (job.ownTab) chrome.tabs.remove(job.ownTab).catch(() => {});
   await server(`/api/agent/tasks/${job.taskId}`, { ok, message }).catch(() => {});
   await log(`${job.kind === 'sync_skus' ? '拉取 SKU' : '同步订单'}${ok ? '完成' : '失败'}：${message}`);
@@ -168,11 +270,22 @@ async function tick() {
       await store.set('job', job);
       await log(`开始${job.kind === 'sync_skus' ? '拉取商品 SKU' : '同步订单'}`);
     }
-    const tb = new Taobao(await taobaoTab(job));
+    const tabId = await taobaoTab(job);
+    if (!(await ensureLogin(job, tabId))) return void (await store.set('job', job));
+    const tb = new Taobao(tabId);
     const done = job.kind === 'sync_skus' ? await runSkus(tb) : await stepOrders(tb, job);
     if (done) await finish(job, true, done);
     else await store.set('job', job);
   } catch (e) {
+    // 干到一半登录过期：把页面带回千牛（会跳登录页），下一分钟自动登录后接着做
+    if (e.login && job && !job.loginTried) {
+      const tabs = await chrome.tabs.query({ url: ['https://myseller.taobao.com/*', 'https://qn.taobao.com/*'] });
+      const t = (job.ownTab && tabs.find((x) => x.id === job.ownTab)) || tabs[0];
+      if (t) await chrome.tabs.update(t.id, { url: SOLD_URL });
+      await store.set('job', job);
+      await log('千牛登录过期，下一分钟自动登录后继续');
+      return;
+    }
     // 出错现场（淘宝返回的网页等）传到小库存，方便排查
     if (e.debug) await server('/api/agent/debug', { message: e.message, ...e.debug }).catch(() => {});
     if (job) await finish(job, false, e.message ?? String(e));

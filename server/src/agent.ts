@@ -51,6 +51,8 @@ export function agentStatus(db: DB) {
   return {
     token: kvGet(db, 'agent_token'),
     last_seen: kvGet(db, 'agent_last_seen'),
+    /** 同步后还没确认的订单数：有就不让再同步 */
+    reviews: (db.prepare('SELECT COUNT(*) n FROM taobao_reviews WHERE confirmed_at IS NULL').get() as { n: number }).n,
     tasks: db
       .prepare(
         `SELECT t.*, u.name AS created_by_name FROM agent_tasks t LEFT JOIN users u ON u.id = t.created_by ORDER BY t.id DESC LIMIT 20`,
@@ -64,6 +66,11 @@ export function createTask(db: DB, userId: number | null, kind: string): number 
   // 同类任务还没做完就不重复排
   const open = db.prepare("SELECT id FROM agent_tasks WHERE kind = ? AND status IN ('pending', 'running')").get(kind) as { id: number } | undefined;
   if (open) return open.id;
+  if (kind === 'sync_orders') {
+    // 同 taobao.pendingReviews（不引 taobao.ts，避免和 db.ts 循环引用）
+    const n = (db.prepare('SELECT COUNT(*) n FROM taobao_reviews WHERE confirmed_at IS NULL').get() as { n: number }).n;
+    if (n) throw new BizError(`上次同步还有 ${n} 笔订单没确认，确认完再同步`);
+  }
   const id = Number(db.prepare('INSERT INTO agent_tasks (kind, created_by) VALUES (?, ?)').run(kind, userId).lastInsertRowid);
   log(db, userId, 'agent_task', `task:${id}`, { kind });
   return id;
@@ -83,7 +90,18 @@ export function nextTask(db: DB) {
 
 /** 插件自己按时发起的任务：直接记成进行中 */
 export function startOwnTask(db: DB, kind: string) {
-  const id = createTask(db, null, kind);
+  let id: number;
+  try {
+    id = createTask(db, null, kind);
+  } catch (e) {
+    // 有没确认的订单：自动同步跳过，任务列表里留一笔说明
+    if (e instanceof BizError)
+      db.prepare("INSERT INTO agent_tasks (kind, status, message, finished_at) VALUES (?, 'failed', ?, datetime('now', 'localtime'))").run(
+        kind,
+        `自动同步跳过：${e.message}`,
+      );
+    throw e;
+  }
   db.prepare("UPDATE agent_tasks SET status = 'running', started_at = COALESCE(started_at, datetime('now', 'localtime')) WHERE id = ?").run(id);
   return { id, kind };
 }

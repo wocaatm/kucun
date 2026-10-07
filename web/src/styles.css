@@ -1111,3 +1111,27 @@ body {
 .adm-list-item-content-extra {
   flex-shrink: 0;
 }
+
+.review-card .fund-main span {
+  font-size: 14px;
+}
+.review-subs {
+  margin: 8px 0;
+  padding: 8px 0;
+  border-top: 1px dashed var(--adm-color-border, #eee);
+  border-bottom: 1px dashed var(--adm-color-border, #eee);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.review-refund {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fff4e5;
+  font-size: 13px;
+}
+.line-in {
+  margin-top: 6px;
+  gap: 8px;
+}

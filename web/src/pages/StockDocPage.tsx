@@ -1,10 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Button, Dialog, Form, Input, NavBar, TextArea, Toast } from 'antd-mobile';
 import dayjs from 'dayjs';
-import { money, post, type CatalogItem, type Product, type Upload } from '../api';
+import { get, money, post, type CatalogItem, type Product, type Upload } from '../api';
 import { useSession } from '../store';
-import ItemsEditor, { isTotalMode, linesToItems, linesTotal, newKey, type EditorMode, type Line } from '../components/ItemsEditor';
+import ItemsEditor, { defaultPrice, isTotalMode, linesToItems, linesTotal, newKey, type EditorMode, type Line } from '../components/ItemsEditor';
 import ImagePicker from '../components/ImagePicker';
 import AdjustmentsEditor, { adjustmentsToInput, adjustmentsTotal, type Adjustment } from '../components/AdjustmentsEditor';
 import { AccountField, ChipField, DateField } from '../components/fields';
@@ -56,6 +56,19 @@ export default function StockDocPage() {
   const [recognizing, setRecognizing] = useState(false);
   const [receiptTotal, setReceiptTotal] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // 从商品详情点进来（?product=id）：直接带上这个商品，盘点就是只盘它
+  const productId = params.get('product');
+  useEffect(() => {
+    if (!productId) return;
+    get<{ product: Product }>(`/api/products/${productId}`)
+      .then(({ product: p }) =>
+        setLines([
+          { key: newKey(), product: p, qty: 1, price: defaultPrice(p, mode), counted: mode === 'stocktake' ? Math.max(p.stock_qty, 0) : undefined },
+        ]),
+      )
+      .catch((e) => Toast.show(e.message));
+  }, [productId, mode]);
 
   const hasMoney = mode === 'purchase' || mode === 'sale';
   const canRecognize = hasMoney && meta?.vision_enabled;
@@ -125,6 +138,11 @@ export default function StockDocPage() {
       content: (
         <div className="confirm-body">
           <div>{lines.length} 种商品，共 {lines.reduce((s, l) => s + l.qty, 0)} 件</div>
+          {mode === 'purchase' && lines.some((l) => l.inQty != null && l.inQty < l.qty) && (
+            <div className="warn-text">
+              其中 {lines.reduce((s, l) => s + l.qty - (l.inQty ?? l.qty), 0)} 件不入库（不加库存，只记花的钱）
+            </div>
+          )}
           {hasMoney && (
             <div>
               {mode === 'sale' ? '收款' : '付款'}：<b>{acc?.name}</b> {money(total)}

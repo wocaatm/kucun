@@ -3,6 +3,10 @@ import { md5 } from './md5.js';
 
 const APP_KEY = '12574478';
 export const SOLD_URL = 'https://myseller.taobao.com/home.htm/trade-platform/tp/sold';
+/** 千牛登录页（未登录时会跳到这里，登录表单在 havanalogin 的 iframe 里） */
+export const LOGIN_RE = /login\.taobao\.com|loginmyseller\.taobao\.com|havanalogin\.taobao\.com/;
+/** 登录过期：后台会自动重新登录，不算任务失败 */
+export const loginError = () => Object.assign(new Error('千牛登录过期'), { login: true });
 
 /** 在千牛标签页里发一个请求；as = json | text | base64 */
 function pageFetch(req) {
@@ -39,7 +43,7 @@ export class Taobao {
     const [res] = await chrome.scripting.executeScript({ target: { tabId: this.tabId }, world: 'MAIN', func: pageFetch, args: [req] });
     if (res.error) throw new Error(res.error.message ?? String(res.error));
     const out = res.result;
-    if (/login\.taobao\.com|loginmyseller/.test(out.url)) throw new Error('千牛没登录或登录过期，请在浏览器里重新登录千牛');
+    if (LOGIN_RE.test(out.url)) throw loginError();
     return out;
   }
 
@@ -57,6 +61,7 @@ export class Taobao {
     const ret = String(r.data?.ret?.[0] ?? '');
     if (ret.startsWith('SUCCESS')) return r.data.data;
     if (retry && /TOKEN_EMPTY|TOKEN_EXOIRED|TOKEN_EXPIRED/.test(ret)) return this.mtop(api, data, false, opts);
+    if (/SESSION_EXPIRED|FAIL_SYS_SESSION/.test(ret)) throw loginError();
     if (/RGV587|FAIL_SYS_USER_VALIDATE/.test(ret)) throw new Error('淘宝要求验证（滑块），请打开千牛页面手动验证后再试');
     throw new Error(`${api}：${ret || '请求失败'}`);
   }
